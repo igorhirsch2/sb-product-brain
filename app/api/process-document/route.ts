@@ -45,6 +45,33 @@ export async function POST(req:NextRequest){
     }
     if(!result)throw directError||new Error('Astra não encontrou dados confiáveis para este documento.')
 
+    if(result.summary?.recovery){
+      const auxiliaryRows=(result.rows||[]).filter((r:any)=>/^911\./.test(String(r.supplier_product_code||'')))
+      if(auxiliaryRows.length){
+        const delRows=await supabase.from('extraction_rows').delete().eq('job_id',jobId).like('supplier_product_code','911.%')
+        if(delRows.error)throw delRows.error
+      }
+      const {data:jobProposals,error:proposalReadError}=await supabase.from('change_proposals').select('id,proposed_data').eq('job_id',jobId)
+      if(proposalReadError)throw proposalReadError
+      const auxiliaryProposalIds=(jobProposals||[]).filter((p:any)=>{
+        const supplierCodes=p.proposed_data?.supplier_codes||[]
+        return supplierCodes.length>0&&supplierCodes.every((code:any)=>/^911\./.test(String(code)))
+      }).map((p:any)=>p.id)
+      if(auxiliaryProposalIds.length){
+        const delProps=await supabase.from('change_proposals').delete().in('id',auxiliaryProposalIds)
+        if(delProps.error)throw delProps.error
+      }
+      result.rows=(result.rows||[]).filter((r:any)=>!/^911\./.test(String(r.supplier_product_code||'')))
+      result.proposals=(result.proposals||[]).filter((p:any)=>{
+        const supplierCodes=p.proposed_data?.supplier_codes||[]
+        return !(supplierCodes.length>0&&supplierCodes.every((code:any)=>/^911\./.test(String(code))))
+      })
+      result.summary.prices_detected=result.rows.length
+      result.summary.products_detected=result.proposals.length
+      result.summary.excluded_auxiliary_rows=auxiliaryRows.length
+      result.summary.auxiliary_strategy='Códigos 911 preservados fora dos produtos-base para futura modelagem como componentes/opções.'
+    }
+
     const done=await supabase.from('ingestion_jobs').update({status:'review',completed_at:new Date().toISOString(),total_rows:result.rows.length,matched_rows:result.rows.filter((x:any)=>x.product_id).length,review_rows:result.rows.length,extraction_summary:result.summary,error_message:null}).eq('id',jobId);if(done.error)throw done.error
     const sd=await supabase.from('source_documents').update({status:'review',approval_status:'review'}).eq('id',documentId);if(sd.error)throw sd.error
     await learnSupplierProfile(supabase,brand.id,document.document_type,result.summary,profiles?.[0]||null)
