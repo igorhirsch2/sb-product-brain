@@ -14,6 +14,7 @@ export default function ProductDetail({product,brand,supabase,userRole,onClose}:
   const [terms,setTerms]=useState<any>(null)
   const [codes,setCodes]=useState<any[]>([])
   const [documents,setDocuments]=useState<any[]>([])
+  const [approvals,setApprovals]=useState<any[]>([])
   const [dimension,setDimension]=useState('')
   const [group,setGroup]=useState('')
   const [variant,setVariant]=useState('')
@@ -24,8 +25,14 @@ export default function ProductDetail({product,brand,supabase,userRole,onClose}:
   const [sourceSearch,setSourceSearch]=useState('')
   const [markupDraft,setMarkupDraft]=useState<Record<string,string>>({})
   const [savingMarkup,setSavingMarkup]=useState('')
+  const [requestingApproval,setRequestingApproval]=useState(false)
 
   useEffect(()=>{load()},[product.id,userRole])
+
+  async function loadApprovals(){
+    const {data}=await supabase.from('price_approval_requests').select('*').eq('product_id',product.id).order('requested_at',{ascending:false}).limit(100)
+    setApprovals(data||[])
+  }
 
   async function load(){
     const [d,s,c]=await Promise.all([
@@ -36,6 +43,7 @@ export default function ProductDetail({product,brand,supabase,userRole,onClose}:
     setDimensions(d.data||[])
     setSafeOptions(s.data||[])
     setCodes(c.data||[])
+    await loadApprovals()
 
     if(!canSeeInternal){
       setEntries([]);setTerms(null);setDocuments([]);return
@@ -75,6 +83,7 @@ export default function ProductDetail({product,brand,supabase,userRole,onClose}:
   const minimumSale=safeEntry?.minimum_sale_price!=null?Number(safeEntry.minimum_sale_price):null
   const policyStatus=!saleN||(!targetSale&&!minimumSale)?'neutral':targetSale&&saleN>=targetSale?'good':minimumSale&&saleN>=minimumSale?'warn':minimumSale&&saleN<minimumSale?'bad':'warn'
   const policyMessage=policyStatus==='good'?'Preço dentro da política comercial.':policyStatus==='warn'?'Preço permitido, mas próximo do limite comercial.':policyStatus==='bad'?'Este valor requer aprovação da gerência.':'Política comercial ainda não definida para este item.'
+  const pendingRequest=approvals.find((a:any)=>a.status==='pending'&&a.price_entry_id===safeEntry?.price_entry_id&&Math.abs(Number(a.requested_price)-saleN)<0.01)
 
   const tableMarkup=entry?.price_tables?.reference_markup?Number(entry.price_tables.reference_markup):null
   const sourcePrice=entry?.source_price!=null?Number(entry.source_price):entry?.price_value!=null?Number(entry.price_value):null
@@ -84,6 +93,26 @@ export default function ProductDetail({product,brand,supabase,userRole,onClose}:
   const realizedMarkup=cost&&saleN?saleN/cost:null
   const margin=cost&&saleN?((saleN-cost)/saleN)*100:null
   const primaryCode=codes.find((c:any)=>c.is_primary)?.product_code||product.manufacturer_code
+
+  async function requestApproval(){
+    if(!safeEntry?.price_entry_id||!saleN)return
+    setRequestingApproval(true)
+    try{
+      const {data:{user}}=await supabase.auth.getUser();if(!user)throw new Error('Sua sessão expirou.')
+      const {error}=await supabase.from('price_approval_requests').insert({product_id:product.id,price_entry_id:safeEntry.price_entry_id,requested_price:saleN,status:'pending',requested_by:user.id})
+      if(error)throw error
+      await loadApprovals()
+    }catch(e:any){alert(e.message||String(e))}finally{setRequestingApproval(false)}
+  }
+
+  async function reviewApproval(item:any,status:'approved'|'rejected'){
+    try{
+      const {data:{user}}=await supabase.auth.getUser();if(!user)throw new Error('Sua sessão expirou.')
+      const {error}=await supabase.from('price_approval_requests').update({status,reviewed_by:user.id,reviewed_at:new Date().toISOString()}).eq('id',item.id)
+      if(error)throw error
+      await loadApprovals()
+    }catch(e:any){alert(e.message||String(e))}
+  }
 
   async function openDocument(doc:any){
     const {data,error}=await supabase.storage.from(doc.storage_bucket||'supplier-tables').createSignedUrl(doc.storage_path,300)
@@ -135,10 +164,10 @@ export default function ProductDetail({product,brand,supabase,userRole,onClose}:
         <label className="field"><span>Grupo de revestimento</span><select value={group} onChange={e=>setGroup(e.target.value)}><option value="">Primeiro disponível</option>{groups.map((g:any)=><option key={g} value={g}>{g}</option>)}</select></label>
         <label className="field"><span>Revestimento / acabamento escolhido</span><input value={finish} onChange={e=>setFinish(e.target.value)} placeholder="Ex.: Bouclé Areia TC-3281"/></label>
       </section>
-      <section className="panel pad salesPricePanel"><h3>Valor da proposta</h3><div className="tablePrice"><span>Preço de tabela</span><strong>{money(tablePrice)}</strong></div><label className="field saleField"><span>Preço da proposta</span><input type="number" step="0.01" value={sale} onChange={e=>setSale(e.target.value)}/></label><div className={`salesPolicy ${policyStatus}`}><span className="policyDot"/><div><b>{policyMessage}</b><small>{policyStatus==='bad'?'Ajuste o valor ou solicite aprovação antes de fechar.':'A política interna continua oculta nesta tela.'}</small></div></div></section>
+      <section className="panel pad salesPricePanel"><h3>Valor da proposta</h3><div className="tablePrice"><span>Preço de tabela</span><strong>{money(tablePrice)}</strong></div><label className="field saleField"><span>Preço da proposta</span><input type="number" step="0.01" value={sale} onChange={e=>setSale(e.target.value)}/></label><div className={`salesPolicy ${policyStatus}`}><span className="policyDot"/><div><b>{policyMessage}</b><small>{policyStatus==='bad'?'Ajuste o valor ou solicite aprovação antes de fechar.':'A política interna continua oculta nesta tela.'}</small>{policyStatus==='bad'&&<button className="approvalRequestBtn" onClick={requestApproval} disabled={!!pendingRequest||requestingApproval}>{pendingRequest?'Aprovação solicitada':requestingApproval?'Enviando…':'Solicitar aprovação'}</button>}</div></div></section>
     </div>}
 
-    {tab==='internal'&&canSeeInternal&&<div className="internalMode"><div className="internalWarning">Área restrita · não utilizar diante do cliente.</div><div className="internalKpis"><article><span>Custo efetivo</span><strong>{money(cost)}</strong></article><article><span>Markup da tabela</span><strong>{tableMarkup?tableMarkup.toFixed(2):'—'}</strong></article><article><span>Markup alvo</span><strong>{targetMarkup?targetMarkup.toFixed(2):'—'}</strong></article><article><span>Markup mínimo</span><strong>{minMarkup?minMarkup.toFixed(2):'—'}</strong></article><article><span>Markup realizado</span><strong>{realizedMarkup?realizedMarkup.toFixed(3):'—'}</strong></article><article><span>Margem bruta estimada</span><strong>{margin?margin.toFixed(1)+'%':'—'}</strong></article></div><div className={`health ${policyStatus}`}><small>{policyMessage}</small></div></div>}
+    {tab==='internal'&&canSeeInternal&&<div className="internalMode"><div className="internalWarning">Área restrita · não utilizar diante do cliente.</div><div className="internalKpis"><article><span>Custo efetivo</span><strong>{money(cost)}</strong></article><article><span>Markup da tabela</span><strong>{tableMarkup?tableMarkup.toFixed(2):'—'}</strong></article><article><span>Markup alvo</span><strong>{targetMarkup?targetMarkup.toFixed(2):'—'}</strong></article><article><span>Markup mínimo</span><strong>{minMarkup?minMarkup.toFixed(2):'—'}</strong></article><article><span>Markup realizado</span><strong>{realizedMarkup?realizedMarkup.toFixed(3):'—'}</strong></article><article><span>Margem bruta estimada</span><strong>{margin?margin.toFixed(1)+'%':'—'}</strong></article></div><div className={`health ${policyStatus}`}><small>{policyMessage}</small></div><section className="approvalPanel"><div className="approvalPanelHead"><h3>Solicitações de aprovação</h3><span>{approvals.filter((a:any)=>a.status==='pending').length} pendentes</span></div>{approvals.length===0?<div className="empty">Nenhuma solicitação para este produto.</div>:approvals.map((a:any)=><div className="approvalRow" key={a.id}><div><b>{money(a.requested_price)}</b><small>{a.status==='pending'?'Aguardando decisão':a.status==='approved'?'Aprovado':'Rejeitado'} · {new Date(a.requested_at).toLocaleString('pt-BR')}</small></div>{a.status==='pending'?<div><button onClick={()=>reviewApproval(a,'rejected')}>Rejeitar</button><button className="primary" onClick={()=>reviewApproval(a,'approved')}>Aprovar</button></div>:<span className={`pill ${a.status==='rejected'?'danger':''}`}>{a.status==='approved'?'Aprovado':'Rejeitado'}</span>}</div>)}</section></div>}
 
     {tab==='source'&&canSeeInternal&&<div className="productSource">
       <div className="sourceHero"><div><span className="eyebrow">RASTREABILIDADE</span><h3>Origem permanente do produto</h3><p>Cada preço mantém vínculo com tabela, código, variação, medida e grupo.</p></div><input className="search" value={sourceSearch} onChange={e=>setSourceSearch(e.target.value)} placeholder="Buscar código, variação, medida…"/></div>
