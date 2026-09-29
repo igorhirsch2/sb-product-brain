@@ -114,17 +114,24 @@ export async function applyProductProposal(opts:{supabase:SupabaseClient; propos
   let {data:priceTable,error:ptErr}=await supabase.from('price_tables').select('*').eq('source_document_id',proposal.source_document_id).maybeSingle()
   if(ptErr)throw ptErr
   if(!priceTable){
-    const pti=await supabase.from('price_tables').insert({brand_id:brand.id,source_document_id:proposal.source_document_id,name:doc.filename,currency:'BRL',valid_from:doc.valid_from,valid_until:doc.valid_until,status:'active',metadata:{job_id:proposal.job_id},price_basis:doc.price_basis,ipi_mode:doc.ipi_mode,ipi_rate:doc.ipi_rate,freight_mode:doc.freight_mode,freight_value:doc.freight_value,created_by:userId}).select().single()
+    const pti=await supabase.from('price_tables').insert({brand_id:brand.id,source_document_id:proposal.source_document_id,name:doc.filename,currency:'BRL',valid_from:doc.valid_from,valid_until:doc.valid_until,status:'active',metadata:{job_id:proposal.job_id},price_basis:doc.price_basis,reference_markup:doc.reference_markup,ipi_mode:doc.ipi_mode,ipi_rate:doc.ipi_rate,freight_mode:doc.freight_mode,freight_value:doc.freight_value,created_by:userId}).select().single()
     if(pti.error)throw pti.error
     priceTable=pti.data
+  }else if(priceTable.reference_markup!==doc.reference_markup){
+    const ptUpdate=await supabase.from('price_tables').update({reference_markup:doc.reference_markup}).eq('id',priceTable.id).select().single()
+    if(ptUpdate.error)throw ptUpdate.error
+    priceTable=ptUpdate.data
   }
 
+  const referenceMarkup=Number(doc.reference_markup||priceTable.reference_markup||0)||null
   const overrides=pd.price_overrides||{}
   const entries=rows.map((r:any)=>{
     const overridden=Object.prototype.hasOwnProperty.call(overrides,r.id)
     const source=overridden?Number(overrides[r.id]):Number(r.price_value)
     const finalValue=doc.price_basis==='cost'?effectiveCost(source,doc):source
-    return {price_table_id:priceTable.id,extraction_row_id:r.id,product_id:productId,supplier_product_code:r.supplier_product_code,dimension_signature:{label:r.dimension_label,width_mm:r.width_mm,depth_mm:r.depth_mm,height_mm:r.height_mm},pricing_group:r.pricing_group,finish_group:r.finish_group,configuration:{variant_label:r.source_locator?.variant_label||r.notes||null,review_override:overridden||false},cost_price:doc.price_basis==='cost'?finalValue:null,suggested_retail:doc.price_basis==='sale'?source:null,currency:'BRL',source_locator:r.source_locator,price_basis:doc.price_basis||'sale',source_price:source,ipi_rate:doc.ipi_rate,freight_value:doc.freight_value,price_value:finalValue}
+    const derivedCost=doc.price_basis==='sale'&&referenceMarkup?source/referenceMarkup:doc.price_basis==='cost'?finalValue:null
+    const derivedRetail=doc.price_basis==='sale'?source:doc.price_basis==='cost'&&referenceMarkup?finalValue*referenceMarkup:null
+    return {price_table_id:priceTable.id,extraction_row_id:r.id,product_id:productId,supplier_product_code:r.supplier_product_code,dimension_signature:{label:r.dimension_label,width_mm:r.width_mm,depth_mm:r.depth_mm,height_mm:r.height_mm},pricing_group:r.pricing_group,finish_group:r.finish_group,configuration:{variant_label:r.source_locator?.variant_label||r.notes||null,review_override:overridden||false},cost_price:derivedCost,suggested_retail:derivedRetail,currency:'BRL',source_locator:r.source_locator,price_basis:doc.price_basis||'sale',source_price:source,ipi_rate:doc.ipi_rate,freight_value:doc.freight_value,price_value:finalValue}
   })
   for(let i=0;i<entries.length;i+=250){
     const pe=await supabase.from('price_entries').upsert(entries.slice(i,i+250),{onConflict:'price_table_id,extraction_row_id'})
