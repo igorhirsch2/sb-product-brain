@@ -7,6 +7,7 @@ import Modal from '@/components/Modal'
 import ProductDetail from '@/components/ProductDetail'
 import { applyProductProposal } from '@/lib/applyProposal'
 import { learnSupplierProfile, parseSupplierWorkbook } from '@/lib/astra'
+import { syncSalesOptionsForBrand } from '@/lib/salesOptions'
 import { numberValue, slug, STATUS_LABELS, type AnyRow } from '@/lib/utils'
 
 type Brand = AnyRow & {id:string;name:string}
@@ -36,7 +37,7 @@ export default function Home(){
     const [b,p,pr,cp]=await Promise.all([
       supabase.from('brands').select('*').order('name'),
       supabase.from('products').select('*').order('name').limit(5000),
-      supabase.from('profiles').select('*').eq('id',session.user.id).maybeSingle(),
+      supabase.from('profiles').select('*').eq('user_id',session.user.id).maybeSingle(),
       supabase.from('change_proposals').select('*').order('created_at',{ascending:false}).limit(1000)
     ])
     setBrands((b.data||[]) as Brand[]);setProducts((p.data||[]) as Product[]);setProfile(pr.data);setAllProposals(cp.data||[])
@@ -68,8 +69,13 @@ export default function Home(){
   }
   async function saveTerms(){
     if(!supabase||!selectedBrand)return
+    setBusy('Atualizando política comercial')
     const {error}=await supabase.from('supplier_commercial_terms').insert({brand_id:selectedBrand.id,valid_from:form.valid_from||null,valid_until:form.valid_until||null,target_markup:numberValue(form.target_markup),minimum_markup:numberValue(form.minimum_markup),payment_terms:form.payment_terms||null,lead_time_min_days:numberValue(form.lead_time_min_days),lead_time_max_days:numberValue(form.lead_time_max_days),ipi_mode:form.ipi_mode||'unknown',ipi_rate:numberValue(form.ipi_rate),freight_mode:form.freight_mode||'unknown',freight_value:numberValue(form.freight_value),notes:form.notes||null,status:'approved',created_by:session.user.id,approved_by:session.user.id,approved_at:new Date().toISOString()})
-    if(error)alert(error.message);else{setModal(null);await loadSupplier(selectedBrand.id)}
+    if(error)alert(error.message);else{
+      try{await syncSalesOptionsForBrand(supabase,selectedBrand.id)}catch(e:any){console.error(e)}
+      setModal(null);await loadSupplier(selectedBrand.id)
+    }
+    setBusy('')
   }
   async function savePromo(){
     if(!supabase||!selectedBrand)return
@@ -127,7 +133,7 @@ export default function Home(){
     {selectedBrand&&<SupplierView brand={selectedBrand} tab={supplierTab} setTab={setSupplierTab} products={products.filter(p=>p.brand_id===selectedBrand.id)} docs={docs} terms={terms} promos={promos} reps={reps} proposals={proposals} profiles={profiles} onBack={()=>setSelectedBrand(null)} openModal={openModal} approve={approve} reject={reject} openOriginal={openOriginal}/>} 
 
     {active==='inteligencia'&&!selectedBrand&&<><Header eyebrow="ASTRA" title="Revisões pendentes" subtitle="O que a inteligência encontrou antes de virar dado oficial."/><section className="panel"><div className="panelHead"><h2>Por fornecedor</h2><span>{allProposals.filter(p=>p.status==='pending').length} propostas pendentes</span></div>{brands.map(b=>{const n=allProposals.filter(p=>p.brand_id===b.id&&p.status==='pending').length;return <div className="simpleRow" key={b.id}><b>{b.name}</b><span>{n} pendências</span><button onClick={()=>{openSupplier(b);setSupplierTab('intelligence')}}>Revisar</button></div>})}</section></>}
-  </main>{modal&&<Modal kind={modal} form={form} setForm={setForm} close={()=>setModal(null)} saveBrand={saveBrand} saveTerms={saveTerms} savePromo={savePromo} saveRep={saveRep} uploadDocument={uploadDocument} brands={brands} supabase={supabase} session={session} reload={loadBase}/>} {selectedProduct&&supabase&&<ProductDetail product={selectedProduct} brand={brands.find(b=>b.id===selectedProduct.brand_id)} supabase={supabase} onClose={()=>setSelectedProduct(null)}/>}</div>
+  </main>{modal&&<Modal kind={modal} form={form} setForm={setForm} close={()=>setModal(null)} saveBrand={saveBrand} saveTerms={saveTerms} savePromo={savePromo} saveRep={saveRep} uploadDocument={uploadDocument} brands={brands} supabase={supabase} session={session} reload={loadBase}/>} {selectedProduct&&supabase&&<ProductDetail product={selectedProduct} brand={brands.find(b=>b.id===selectedProduct.brand_id)} supabase={supabase} userRole={profile?.role||'vendedor'} onClose={()=>setSelectedProduct(null)}/>}</div>
 }
 
 function Header({eyebrow,title,subtitle,action,onAction}:{eyebrow:string,title:string,subtitle:string,action?:string,onAction?:()=>void}){return <header><div><p className="eyebrow">{eyebrow}</p><h1>{title}</h1><p className="muted">{subtitle}</p></div>{action&&<button className="primary" onClick={onAction}>{action}</button>}</header>}
