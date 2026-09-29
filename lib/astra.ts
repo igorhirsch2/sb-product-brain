@@ -1,5 +1,5 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
-import { norm, numberValue, parseDimensions, slug, uniq, type AnyRow } from './utils'
+import { norm, numberValue, parseDimensions, uniq, type AnyRow } from './utils'
 
 export type ParseContext = {
   supabase: SupabaseClient
@@ -25,16 +25,13 @@ function detectHeader(matrix:any[][], learned:any){
     const find=(re:RegExp)=>cells.findIndex(c=>re.test(c))
     const map={
       name:find(/produto|modelo|descricao|item/), code:find(/codigo|referencia|ref\b/),
-      dimension:find(/medida|dimens/), width:find(/largura|\bl\b/),
-      depth:find(/profundidade|\bp\b/), height:find(/altura|\ba\b/)
+      dimension:find(/medida|dimens/), width:find(/largura|\bl\b/), depth:find(/profundidade|\bp\b/), height:find(/altura|\ba\b/)
     }
     if(map.name<0&&map.code<0)continue
     const priceCols:any[]=[]
     cells.forEach((c,i)=>{
       if(Object.values(map).includes(i))return
-      if(/preco|valor|grupo\s*[a-z0-9]|tecido\s*[a-z0-9]|couro\s*[a-z0-9]|categoria\s*[a-z0-9]/.test(c)){
-        priceCols.push({index:i,name:String(matrix[r][i]||`Valor ${i+1}`),group:String(matrix[r][i]||`Grupo ${i+1}`)})
-      }
+      if(/preco|valor|grupo\s*[a-z0-9]|tecido\s*[a-z0-9]|couro\s*[a-z0-9]|categoria\s*[a-z0-9]/.test(c)) priceCols.push({index:i,name:String(matrix[r][i]||`Valor ${i+1}`),group:String(matrix[r][i]||`Grupo ${i+1}`)})
     })
     if(!priceCols.length&&learned?.price_headers){
       const learnedHeaders=(learned.price_headers as string[]).map(norm)
@@ -69,7 +66,6 @@ export async function parseSupplierWorkbook(file:File,ctx:ParseContext){
       if(ownName)lastName=ownName
       if(ownCode)lastCode=ownCode
       if(!name&&!code)continue
-
       let d:any={}
       if(h.map.dimension>=0)d=parseDimensions(row[h.map.dimension])
       if(!d.dimension_label){
@@ -84,59 +80,28 @@ export async function parseSupplierWorkbook(file:File,ctx:ParseContext){
       const byManufacturer=brandProducts.find(p=>code&&norm(p.manufacturer_code)===norm(code))
       const byName=brandProducts.find(p=>name&&norm(p.name)===norm(name))
       const productId=byCode?.product_id||byManufacturer?.id||byName?.id||null
-
       for(const pc of h.priceCols){
         const price=numberValue(row[pc.index])
         if(price==null||price<=0)continue
-        extracted.push({
-          job_id:jobId,row_index:ri+1,variant_index:pc.index,sheet_name:sheetName,
-          source_locator:{sheet:sheetName,row:ri+1,column:pc.index+1,header:pc.name},raw_payload:{row},
-          product_name_raw:name||null,supplier_product_code:code||null,product_id:productId,
-          dimension_label:d.dimension_label||null,width_mm:d.width_mm||null,depth_mm:d.depth_mm||null,height_mm:d.height_mm||null,
-          pricing_group:pc.group||pc.name,finish_group:null,cost_price:document.price_basis==='cost'?price:null,
-          price_value:price,price_basis:document.price_basis||null,currency:'BRL',
-          confidence:Math.min(.98,(productId?.72:.52)+(code?.12:0)+(name?.08:0)+(d.dimension_label?.06:0)),status:'review'
-        })
+        extracted.push({job_id:jobId,row_index:ri+1,variant_index:pc.index,sheet_name:sheetName,source_locator:{sheet:sheetName,row:ri+1,column:pc.index+1,header:pc.name},raw_payload:{row},product_name_raw:name||null,supplier_product_code:code||null,product_id:productId,dimension_label:d.dimension_label||null,width_mm:d.width_mm||null,depth_mm:d.depth_mm||null,height_mm:d.height_mm||null,pricing_group:pc.group||pc.name,finish_group:null,cost_price:document.price_basis==='cost'?price:null,price_value:price,price_basis:document.price_basis||null,currency:'BRL',confidence:Math.min(.98,(productId?.72:.52)+(code?.12:0)+(name?.08:0)+(d.dimension_label?.06:0)),status:'review'})
       }
     }
   }
 
-  for(let i=0;i<extracted.length;i+=300){
-    const {error}=await supabase.from('extraction_rows').insert(extracted.slice(i,i+300))
-    if(error)throw error
-  }
-
+  for(let i=0;i<extracted.length;i+=300){const {error}=await supabase.from('extraction_rows').insert(extracted.slice(i,i+300));if(error)throw error}
   const grouped=new Map<string,any[]>()
-  for(const r of extracted){
-    const key=norm(r.supplier_product_code)||norm(r.product_name_raw)
-    if(!key)continue
-    if(!grouped.has(key))grouped.set(key,[])
-    grouped.get(key)!.push(r)
-  }
+  for(const r of extracted){const key=norm(r.supplier_product_code)||norm(r.product_name_raw);if(!key)continue;if(!grouped.has(key))grouped.set(key,[]);grouped.get(key)!.push(r)}
   const proposals:any[]=[]
   for(const rows of grouped.values()){
-    const first=rows[0], target=first.product_id
-    proposals.push({
-      job_id:jobId,source_document_id:document.id,brand_id:brand.id,entity_type:'product',action:target?'update':'create',target_id:target,
-      proposed_data:{name:first.product_name_raw||first.supplier_product_code||'Produto sem nome',manufacturer_code:first.supplier_product_code||null,
-        dimensions:uniq(rows.map(x=>x.dimension_label).filter(Boolean)),pricing_groups:uniq(rows.map(x=>x.pricing_group).filter(Boolean)),
-        price_count:rows.length,price_basis:document.price_basis},
-      current_data:target?brandProducts.find(p=>p.id===target)||{}:{},source_locator:{sheet:first.sheet_name,code:first.supplier_product_code,name:first.product_name_raw},
-      dependencies:{},confidence:Math.max(...rows.map(x=>Number(x.confidence)||0)),status:'pending'
-    })
+    const first=rows[0],target=first.product_id
+    proposals.push({job_id:jobId,source_document_id:document.id,brand_id:brand.id,entity_type:'product',action:target?'update':'create',target_id:target,proposed_data:{name:first.product_name_raw||first.supplier_product_code||'Produto sem nome',manufacturer_code:first.supplier_product_code||null,dimensions:uniq(rows.map(x=>x.dimension_label).filter(Boolean)),pricing_groups:uniq(rows.map(x=>x.pricing_group).filter(Boolean)),price_count:rows.length,price_basis:document.price_basis},current_data:target?brandProducts.find(p=>p.id===target)||{}:{},source_locator:{sheet:first.sheet_name,code:first.supplier_product_code,name:first.product_name_raw},dependencies:{},confidence:Math.max(...rows.map(x=>Number(x.confidence)||0)),status:'pending'})
   }
-  for(let i=0;i<proposals.length;i+=200){
-    const {error}=await supabase.from('change_proposals').insert(proposals.slice(i,i+200))
-    if(error)throw error
-  }
+  for(let i=0;i<proposals.length;i+=200){const {error}=await supabase.from('change_proposals').insert(proposals.slice(i,i+200));if(error)throw error}
   return {rows:extracted,proposals,summary:{sheets:wb.SheetNames.length,mappings,products_detected:grouped.size,prices_detected:extracted.length,matched:extracted.filter(x=>x.product_id).length}}
 }
 
 export async function learnSupplierProfile(supabase:SupabaseClient,brandId:string,docType:string,summary:any,existing?:AnyRow|null){
   const mapping={...(existing?.learned_mapping||{}),last_mappings:summary.mappings,price_headers:uniq(summary.mappings.flatMap((m:any)=>m.price_columns?.map((p:any)=>p.name)||[]))}
-  if(existing){
-    await supabase.from('supplier_ai_profiles').update({version:(existing.version||1)+1,learned_mapping:mapping,successful_runs:(existing.successful_runs||0)+1,confidence:Math.min(.95,Number(existing.confidence||.55)+.04),last_used_at:new Date().toISOString()}).eq('id',existing.id)
-  }else{
-    await supabase.from('supplier_ai_profiles').insert({brand_id:brandId,document_type:docType,profile_name:`Astra · ${docType}`,version:1,fingerprints:{},learned_mapping:mapping,learned_rules:{},approved_examples:[],confidence:.55,successful_runs:1,is_active:true,last_used_at:new Date().toISOString()})
-  }
+  if(existing) await supabase.from('supplier_ai_profiles').update({version:(existing.version||1)+1,learned_mapping:mapping,successful_runs:(existing.successful_runs||0)+1,confidence:Math.min(.95,Number(existing.confidence||.55)+.04),last_used_at:new Date().toISOString()}).eq('id',existing.id)
+  else await supabase.from('supplier_ai_profiles').insert({brand_id:brandId,document_type:docType,profile_name:`Astra · ${docType}`,version:1,fingerprints:{},learned_mapping:mapping,learned_rules:{},approved_examples:[],confidence:.55,successful_runs:1,is_active:true,last_used_at:new Date().toISOString()})
 }
