@@ -8,14 +8,15 @@ export async function applyProductProposal(opts:{supabase:SupabaseClient; propos
   const pd=proposal.proposed_data||{}
   let productId=proposal.target_id as string|undefined
 
+  const productPayload={name:pd.name,brand_id:brand.id,manufacturer_code:pd.manufacturer_code||null,product_type:pd.product_type||pd.category||null,updated_by:userId}
   if(!productId){
     let base=slug(pd.name||pd.manufacturer_code||'produto'), candidate=base, n=2
     while((await supabase.from('products').select('id',{count:'exact',head:true}).eq('slug',candidate)).count) candidate=`${base}-${n++}`
-    const created=await supabase.from('products').insert({name:pd.name,slug:candidate,brand_id:brand.id,status:'in_review',manufacturer_code:pd.manufacturer_code||null,created_by:userId,updated_by:userId}).select().single()
+    const created=await supabase.from('products').insert({...productPayload,slug:candidate,status:'in_review',created_by:userId}).select().single()
     if(created.error)throw created.error
     productId=created.data.id
   }else{
-    const updated=await supabase.from('products').update({manufacturer_code:pd.manufacturer_code||null,updated_by:userId}).eq('id',productId)
+    const updated=await supabase.from('products').update(productPayload).eq('id',productId)
     if(updated.error)throw updated.error
   }
 
@@ -27,10 +28,26 @@ export async function applyProductProposal(opts:{supabase:SupabaseClient; propos
 
   const extraction=await supabase.from('extraction_rows').select('*').eq('job_id',proposal.job_id)
   if(extraction.error)throw extraction.error
-  const rows=(extraction.data||[]).filter((r:any)=>{
-    if(supplierCodes.some(c=>norm(c)===norm(r.supplier_product_code)))return true
+  const sourceCodes=uniq<string>(((pd._source_supplier_codes?.length?pd._source_supplier_codes:supplierCodes)||[]).filter(Boolean))
+  let rows=(extraction.data||[]).filter((r:any)=>{
+    if(sourceCodes.some(c=>norm(c)===norm(r.supplier_product_code)))return true
     return pd.name&&norm(r.product_name_raw)===norm(pd.name)
   })
+
+  if(Array.isArray(pd.included_variant_labels)){
+    const allowed=new Set(pd.included_variant_labels.map((x:any)=>norm(x)))
+    rows=rows.filter((r:any)=>allowed.has(norm(r.source_locator?.variant_label||r.notes||'')))
+  }
+  if(Array.isArray(pd.included_dimensions)){
+    const allowed=new Set(pd.included_dimensions.map((x:any)=>norm(x)))
+    rows=rows.filter((r:any)=>allowed.has(norm(r.dimension_label||'')))
+  }
+  if(Array.isArray(pd.included_pricing_groups)){
+    const allowed=new Set(pd.included_pricing_groups.map((x:any)=>norm(x)))
+    rows=rows.filter((r:any)=>allowed.has(norm(r.pricing_group||'')))
+  }
+
+  if(!rows.length)throw new Error('A proposta ficou sem linhas de origem após as correções. Revise códigos, variações, medidas e grupos de preço antes de aprovar.')
 
   const existingDims=await supabase.from('product_dimensions').select('*').eq('product_id',productId)
   if(existingDims.error)throw existingDims.error
@@ -102,10 +119,12 @@ export async function applyProductProposal(opts:{supabase:SupabaseClient; propos
     priceTable=pti.data
   }
 
+  const overrides=pd.price_overrides||{}
   const entries=rows.map((r:any)=>{
-    const source=Number(r.price_value)
+    const overridden=Object.prototype.hasOwnProperty.call(overrides,r.id)
+    const source=overridden?Number(overrides[r.id]):Number(r.price_value)
     const finalValue=doc.price_basis==='cost'?effectiveCost(source,doc):source
-    return {price_table_id:priceTable.id,extraction_row_id:r.id,product_id:productId,supplier_product_code:r.supplier_product_code,dimension_signature:{label:r.dimension_label,width_mm:r.width_mm,depth_mm:r.depth_mm,height_mm:r.height_mm},pricing_group:r.pricing_group,finish_group:r.finish_group,configuration:{variant_label:r.source_locator?.variant_label||r.notes||null},cost_price:doc.price_basis==='cost'?finalValue:null,suggested_retail:doc.price_basis==='sale'?source:null,currency:'BRL',source_locator:r.source_locator,price_basis:doc.price_basis||'sale',source_price:source,ipi_rate:doc.ipi_rate,freight_value:doc.freight_value,price_value:finalValue}
+    return {price_table_id:priceTable.id,extraction_row_id:r.id,product_id:productId,supplier_product_code:r.supplier_product_code,dimension_signature:{label:r.dimension_label,width_mm:r.width_mm,depth_mm:r.depth_mm,height_mm:r.height_mm},pricing_group:r.pricing_group,finish_group:r.finish_group,configuration:{variant_label:r.source_locator?.variant_label||r.notes||null,review_override:overridden||false},cost_price:doc.price_basis==='cost'?finalValue:null,suggested_retail:doc.price_basis==='sale'?source:null,currency:'BRL',source_locator:r.source_locator,price_basis:doc.price_basis||'sale',source_price:source,ipi_rate:doc.ipi_rate,freight_value:doc.freight_value,price_value:finalValue}
   })
   for(let i=0;i<entries.length;i+=250){
     const pe=await supabase.from('price_entries').upsert(entries.slice(i,i+250),{onConflict:'price_table_id,extraction_row_id'})
