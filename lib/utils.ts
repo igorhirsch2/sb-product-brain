@@ -22,18 +22,31 @@ export const money=(v:any)=>v==null||v===''?'—':Number(v).toLocaleString('pt-B
 export function numberValue(v:any){
   if(typeof v==='number') return Number.isFinite(v)?v:null
   let s=String(v??'').trim().replace(/R\$|\s/g,'')
-  if(!s) return null
-  if(s.includes(',')&&s.includes('.')) s=s.replace(/\./g,'').replace(',','.')
-  else if(s.includes(',')) s=s.replace(',','.')
-  const n=Number(s.replace(/[^0-9.-]/g,''))
+  if(!s||/^[-–—]+$/.test(s)) return null
+  s=s.replace(/%$/,'')
+  const comma=s.lastIndexOf(','), dot=s.lastIndexOf('.')
+  if(comma>=0&&dot>=0){
+    if(comma>dot) s=s.replace(/\./g,'').replace(',','.')
+    else s=s.replace(/,/g,'')
+  }else if(comma>=0){
+    const decimals=s.length-comma-1
+    s=decimals===3&&comma>0?s.replace(/,/g,''):s.replace(',','.')
+  }else if(dot>=0){
+    const decimals=s.length-dot-1
+    if(decimals===3&&dot>0&&/^[-+]?\d{1,3}(\.\d{3})+$/.test(s)) s=s.replace(/\./g,'')
+  }
+  const n=Number(s.replace(/[^0-9.+-]/g,''))
   return Number.isFinite(n)?n:null
 }
 
 export function parseDimensions(v:any){
-  const m=String(v??'').match(/(\d{2,4})\s*[xX×]\s*(\d{2,4})(?:\s*[xX×]\s*(\d{2,4}))?/)
-  if(!m) return {}
-  const mm=(x?:string)=>x?(Number(x)<1000?Number(x)*10:Number(x)):null
-  return {width_mm:mm(m[1]),depth_mm:mm(m[2]),height_mm:mm(m[3]),dimension_label:m[0]}
+  const text=String(v??'').trim()
+  const m=text.match(/(\d{2,4}(?:[.,]\d+)?)\s*[xX×]\s*(\d{2,4}(?:[.,]\d+)?)(?:\s*[xX×]\s*(\d{2,4}(?:[.,]\d+)?))?/)
+  const mm=(x?:string|null)=>{if(!x)return null;const n=numberValue(x);return n==null?null:Math.round(n<1000?n*10:n)}
+  if(m) return {width_mm:mm(m[1]),depth_mm:mm(m[2]),height_mm:mm(m[3]),dimension_label:m[0]}
+  const one=text.match(/^\s*(\d{2,4}(?:[.,]\d+)?)\s*(?:cm)?\s*$/i)
+  if(one) return {width_mm:mm(one[1]),depth_mm:null,height_mm:null,dimension_label:text}
+  return {}
 }
 
 export function effectiveCost(base:number,doc:AnyRow){
