@@ -1,0 +1,27 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - feat/product-brain-v1
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+      - name: Build
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: https://kgvhxlrkahzehurqarkz.supabase.co
+          NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: sb_publishable_KXLz4Yf_BK3mtcgQ8upB-g_UHBdv6cH
+        run: npm run build
