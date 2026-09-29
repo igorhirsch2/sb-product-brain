@@ -19,15 +19,16 @@ export async function applyProductProposal(opts:{supabase:SupabaseClient; propos
     if(updated.error)throw updated.error
   }
 
-  if(pd.manufacturer_code){
-    const code=await supabase.from('product_brand_codes').upsert({product_id:productId,brand_id:brand.id,product_code:pd.manufacturer_code,is_primary:true,metadata:{source_document_id:proposal.source_document_id}},{onConflict:'brand_id,product_code'})
+  const supplierCodes=uniq<string>((pd.supplier_codes?.length?pd.supplier_codes:[pd.manufacturer_code]).filter(Boolean))
+  for(const [i,c] of supplierCodes.entries()){
+    const code=await supabase.from('product_brand_codes').upsert({product_id:productId,brand_id:brand.id,product_code:String(c),is_primary:i===0,metadata:{source_document_id:proposal.source_document_id}},{onConflict:'brand_id,product_code'})
     if(code.error)throw code.error
   }
 
   const extraction=await supabase.from('extraction_rows').select('*').eq('job_id',proposal.job_id)
   if(extraction.error)throw extraction.error
   const rows=(extraction.data||[]).filter((r:any)=>{
-    if(pd.manufacturer_code&&norm(r.supplier_product_code)===norm(pd.manufacturer_code))return true
+    if(supplierCodes.some(c=>norm(c)===norm(r.supplier_product_code)))return true
     return pd.name&&norm(r.product_name_raw)===norm(pd.name)
   })
 
@@ -42,7 +43,7 @@ export async function applyProductProposal(opts:{supabase:SupabaseClient; propos
     }
   }
 
-  const groups=uniq(rows.map((r:any)=>r.pricing_group).filter(Boolean))
+  const groups=uniq<string>(rows.map((r:any)=>r.pricing_group).filter(Boolean))
   if(groups.length){
     const groupCode=`${slug(brand.name)}-grupo-preco`
     let {data:group,error:gerr}=await supabase.from('option_groups').select('*').eq('code',groupCode).maybeSingle()
@@ -68,6 +69,31 @@ export async function applyProductProposal(opts:{supabase:SupabaseClient; propos
     }
   }
 
+  const variants=uniq<string>((pd.variant_labels||[]).filter((v:any)=>v&&norm(v)!==norm(pd.name)))
+  if(variants.length>1){
+    const groupCode=`${slug(brand.name)}-${slug(pd.name)}-variacao`
+    let {data:vg,error:vgErr}=await supabase.from('option_groups').select('*').eq('code',groupCode).maybeSingle()
+    if(vgErr)throw vgErr
+    if(!vg){
+      const ins=await supabase.from('option_groups').insert({code:groupCode,name:'Variação',kind:'other',selection_mode:'single',is_active:true}).select().single()
+      if(ins.error)throw ins.error
+      vg=ins.data
+    }
+    const rel=await supabase.from('product_option_groups').upsert({product_id:productId,option_group_id:vg.id,is_required:false,min_select:0,max_select:1,sort_order:1},{onConflict:'product_id,option_group_id'})
+    if(rel.error)throw rel.error
+    for(const [i,v] of variants.entries()){
+      const valueCode=`${groupCode}-${slug(v)}`
+      let {data:value}=await supabase.from('option_values').select('*').eq('option_group_id',vg.id).eq('code',valueCode).maybeSingle()
+      if(!value){
+        const vi=await supabase.from('option_values').insert({option_group_id:vg.id,code:valueCode,name:v,normalized_name:norm(v),sort_order:i,metadata:{brand_id:brand.id},is_active:true}).select().single()
+        if(vi.error)throw vi.error
+        value=vi.data
+      }
+      const pov=await supabase.from('product_option_values').upsert({product_id:productId,option_value_id:value.id,supplier_code:null,is_default:false,is_active:true,metadata:{}},{onConflict:'product_id,option_value_id'})
+      if(pov.error)throw pov.error
+    }
+  }
+
   let {data:priceTable,error:ptErr}=await supabase.from('price_tables').select('*').eq('source_document_id',proposal.source_document_id).maybeSingle()
   if(ptErr)throw ptErr
   if(!priceTable){
@@ -79,10 +105,7 @@ export async function applyProductProposal(opts:{supabase:SupabaseClient; propos
   const entries=rows.map((r:any)=>{
     const source=Number(r.price_value)
     const finalValue=doc.price_basis==='cost'?effectiveCost(source,doc):source
-    return {price_table_id:priceTable.id,extraction_row_id:r.id,product_id:productId,supplier_product_code:r.supplier_product_code,
-      dimension_signature:{label:r.dimension_label,width_mm:r.width_mm,depth_mm:r.depth_mm,height_mm:r.height_mm},pricing_group:r.pricing_group,finish_group:r.finish_group,
-      configuration:{},cost_price:doc.price_basis==='cost'?finalValue:null,suggested_retail:doc.price_basis==='sale'?source:null,currency:'BRL',source_locator:r.source_locator,
-      price_basis:doc.price_basis||'sale',source_price:source,ipi_rate:doc.ipi_rate,freight_value:doc.freight_value,price_value:finalValue}
+    return {price_table_id:priceTable.id,extraction_row_id:r.id,product_id:productId,supplier_product_code:r.supplier_product_code,dimension_signature:{label:r.dimension_label,width_mm:r.width_mm,depth_mm:r.depth_mm,height_mm:r.height_mm},pricing_group:r.pricing_group,finish_group:r.finish_group,configuration:{variant_label:r.source_locator?.variant_label||r.notes||null},cost_price:doc.price_basis==='cost'?finalValue:null,suggested_retail:doc.price_basis==='sale'?source:null,currency:'BRL',source_locator:r.source_locator,price_basis:doc.price_basis||'sale',source_price:source,ipi_rate:doc.ipi_rate,freight_value:doc.freight_value,price_value:finalValue}
   })
   for(let i=0;i<entries.length;i+=250){
     const pe=await supabase.from('price_entries').upsert(entries.slice(i,i+250),{onConflict:'price_table_id,extraction_row_id'})
