@@ -1,5 +1,6 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { effectiveCost, norm, slug, uniq, type AnyRow } from './utils'
+import { syncSalesOptionsForPriceTable } from './salesOptions'
 
 export async function applyProductProposal(opts:{supabase:SupabaseClient; proposal:AnyRow; brand:AnyRow; userId:string}){
   const {supabase,proposal,brand,userId}=opts
@@ -137,6 +138,8 @@ export async function applyProductProposal(opts:{supabase:SupabaseClient; propos
     const pe=await supabase.from('price_entries').upsert(entries.slice(i,i+250),{onConflict:'price_table_id,extraction_row_id'})
     if(pe.error)throw pe.error
   }
+
+  await syncSalesOptionsForPriceTable(supabase,priceTable.id)
 
   if(rows.length){
     const xr=await supabase.from('extraction_rows').update({product_id:productId,status:'approved'}).in('id',rows.map((r:any)=>r.id))
