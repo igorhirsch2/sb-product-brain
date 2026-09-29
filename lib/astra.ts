@@ -108,6 +108,18 @@ function isLikelyCode(v:string){return /^\d{3,4}[.\-/]\d{3,8}$/.test(v)||/^[A-Z0
 
 export async function parseSupplierWorkbook(file:Blob,ctx:ParseContext){
   const {supabase,brand,document,jobId,products,aiProfile}=ctx
+
+  if(typeof window!=='undefined'){
+    const {data:{session}}=await supabase.auth.getSession()
+    if(!session)throw new Error('Sua sessão expirou. Entre novamente.')
+    const response=await fetch('/api/process-document',{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${session.access_token}`},body:JSON.stringify({documentId:document.id,jobId})})
+    const body=await response.json().catch(()=>({}))
+    if(!response.ok)throw new Error(body.error||'Falha ao processar o arquivo no servidor.')
+    const total=Number(body.summary?.prices_detected||0),matched=Number(body.summary?.matched||0)
+    const rows=Array.from({length:total},(_,i)=>({product_id:i<matched?'matched':null}))
+    return {rows,proposals:Array.from({length:Number(body.proposals||0)}),summary:body.summary||{}}
+  }
+
   const XLSX=await import('xlsx')
   const wb=XLSX.read(await file.arrayBuffer(),{type:'array',cellDates:false})
   const brandProducts=products.filter(p=>p.brand_id===brand.id)
@@ -128,7 +140,6 @@ export async function parseSupplierWorkbook(file:Blob,ctx:ParseContext){
       const model=h.map.model>=0?safeText(row[h.map.model]):''
       const description=h.map.description>=0?safeText(row[h.map.description]):''
       const code=h.map.code>=0?safeText(row[h.map.code]):''
-
       if(model&&!code&&!description){currentModel=model;continue}
       if(model&&model.length<80&&!isLikelyCode(model))currentModel=model
       if(description)lastDescription=description
@@ -154,44 +165,28 @@ export async function parseSupplierWorkbook(file:Blob,ctx:ParseContext){
       for(const pc of h.priceCols){
         const price=numberValue(row[pc.index])
         if(price==null||price<=50)continue
-        extracted.push({
-          job_id:jobId,row_index:ri+1,variant_index:pc.index,sheet_name:sheetName,
-          source_locator:{sheet:sheetName,row:ri+1,column:pc.index+1,header:pc.name,variant_label:variantLabel},
-          raw_payload:{row,model:productName,variant_label:variantLabel},product_name_raw:productName,supplier_product_code:code,product_id:productId,
-          dimension_label:d.dimension_label||null,width_mm:d.width_mm||null,depth_mm:d.depth_mm||null,height_mm:d.height_mm||null,
-          pricing_group:pc.group||pc.name,finish_group:null,cost_price:document.price_basis==='cost'?price:null,
-          price_value:price,price_basis:document.price_basis||null,currency:'BRL',
-          confidence:Math.min(.98,(productId?.75:.58)+(.12)+(.08)+(d.dimension_label?.05:0)),status:'review',notes:variantLabel||null
-        })
+        extracted.push({job_id:jobId,row_index:ri+1,variant_index:pc.index,sheet_name:sheetName,source_locator:{sheet:sheetName,row:ri+1,column:pc.index+1,header:pc.name,variant_label:variantLabel},raw_payload:{row,model:productName,variant_label:variantLabel},product_name_raw:productName,supplier_product_code:code,product_id:productId,dimension_label:d.dimension_label||null,width_mm:d.width_mm||null,depth_mm:d.depth_mm||null,height_mm:d.height_mm||null,pricing_group:pc.group||pc.name,finish_group:null,cost_price:document.price_basis==='cost'?price:null,price_value:price,price_basis:document.price_basis||null,currency:'BRL',confidence:Math.min(.98,(productId?.75:.58)+.12+.08+(d.dimension_label?.05:0)),status:'review',notes:variantLabel||null})
       }
     }
   }
 
   if(!extracted.length)throw new Error('Astra não encontrou linhas de produto/preço confiáveis. O arquivo foi preservado para ajuste do perfil de leitura.')
   for(let i=0;i<extracted.length;i+=300){const {error}=await supabase.from('extraction_rows').insert(extracted.slice(i,i+300));if(error)throw error}
-
   const grouped=new Map<string,any[]>()
   for(const r of extracted){const key=norm(r.product_name_raw)||norm(r.supplier_product_code);if(!key)continue;if(!grouped.has(key))grouped.set(key,[]);grouped.get(key)!.push(r)}
   const proposals:any[]=[]
   for(const rows of grouped.values()){
     const first=rows[0]
     const target=rows.map(x=>x.product_id).find(Boolean)||brandProducts.find(p=>norm(p.name)===norm(first.product_name_raw))?.id||null
-    const supplierCodes=uniq(rows.map(x=>x.supplier_product_code).filter(Boolean))
-    const variants=uniq(rows.map(x=>x.source_locator?.variant_label).filter(Boolean))
-    proposals.push({
-      job_id:jobId,source_document_id:document.id,brand_id:brand.id,entity_type:'product',action:target?'update':'create',target_id:target,
-      proposed_data:{name:first.product_name_raw||first.supplier_product_code||'Produto sem nome',manufacturer_code:supplierCodes[0]||null,supplier_codes:supplierCodes,
-        variant_labels:variants,dimensions:uniq(rows.map(x=>x.dimension_label).filter(Boolean)),pricing_groups:uniq(rows.map(x=>x.pricing_group).filter(Boolean)),
-        price_count:rows.length,price_basis:document.price_basis},
-      current_data:target?brandProducts.find(p=>p.id===target)||{}:{},source_locator:{sheet:first.sheet_name,codes:supplierCodes,name:first.product_name_raw},
-      dependencies:{},confidence:Math.max(...rows.map(x=>Number(x.confidence)||0)),status:'pending'
-    })
+    const supplierCodes=uniq(rows.map(x=>x.supplier_product_code).filter(Boolean)),variants=uniq(rows.map(x=>x.source_locator?.variant_label).filter(Boolean))
+    proposals.push({job_id:jobId,source_document_id:document.id,brand_id:brand.id,entity_type:'product',action:target?'update':'create',target_id:target,proposed_data:{name:first.product_name_raw||first.supplier_product_code||'Produto sem nome',manufacturer_code:supplierCodes[0]||null,supplier_codes:supplierCodes,variant_labels:variants,dimensions:uniq(rows.map(x=>x.dimension_label).filter(Boolean)),pricing_groups:uniq(rows.map(x=>x.pricing_group).filter(Boolean)),price_count:rows.length,price_basis:document.price_basis},current_data:target?brandProducts.find(p=>p.id===target)||{}:{},source_locator:{sheet:first.sheet_name,codes:supplierCodes,name:first.product_name_raw},dependencies:{},confidence:Math.max(...rows.map(x=>Number(x.confidence)||0)),status:'pending'})
   }
   for(let i=0;i<proposals.length;i+=200){const {error}=await supabase.from('change_proposals').insert(proposals.slice(i,i+200));if(error)throw error}
   return {rows:extracted,proposals,summary:{sheets:wb.SheetNames.length,mappings,products_detected:grouped.size,prices_detected:extracted.length,matched:extracted.filter(x=>x.product_id).length}}
 }
 
 export async function learnSupplierProfile(supabase:SupabaseClient,brandId:string,docType:string,summary:any,existing?:AnyRow|null){
+  if(typeof window!=='undefined')return
   const mapping={...(existing?.learned_mapping||{}),last_mappings:summary.mappings,price_headers:uniq(summary.mappings.flatMap((m:any)=>m.price_columns?.map((p:any)=>p.name)||[]))}
   if(existing) await supabase.from('supplier_ai_profiles').update({version:(existing.version||1)+1,learned_mapping:mapping,successful_runs:(existing.successful_runs||0)+1,confidence:Math.min(.95,Number(existing.confidence||.55)+.04),last_used_at:new Date().toISOString()}).eq('id',existing.id)
   else await supabase.from('supplier_ai_profiles').insert({brand_id:brandId,document_type:docType,profile_name:`Astra · ${docType}`,version:1,fingerprints:{},learned_mapping:mapping,learned_rules:{},approved_examples:[],confidence:.55,successful_runs:1,is_active:true,last_used_at:new Date().toISOString()})
