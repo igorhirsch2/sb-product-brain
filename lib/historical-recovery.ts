@@ -129,7 +129,7 @@ export async function recoverHistoricalSupplierExtraction(ctx:RecoveryContext){
     }else model=currentModelBySheet.get(sheet)||model
 
     if(!rawCode||!isCode(rawCode))continue
-    if(mechanism)continue // mecanismos compartilhados serão modelados como opções, não como códigos do produto
+    if(mechanism)continue
     if(!model||isGenericNonProduct(model))continue
 
     const modelKey=norm(model)
@@ -154,7 +154,7 @@ export async function recoverHistoricalSupplierExtraction(ctx:RecoveryContext){
         product_name_raw:productName,supplier_product_code:rawCode,product_id:productId,
         dimension_label:dimension||null,width_mm:parsedDim.width_mm||null,depth_mm:parsedDim.depth_mm||null,height_mm:parsedDim.height_mm||null,
         pricing_group:pc.label,finish_group:null,cost_price:document.price_basis==='cost'?price:null,price_value:price,price_basis:document.price_basis||'sale',currency:'BRL',
-        confidence:productId?.96:.89,status:'review',notes:desc||null
+        confidence:productId?.96:.89,status:'needs_review',notes:desc||null
       })
     }
   }
