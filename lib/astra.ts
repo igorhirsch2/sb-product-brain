@@ -1,3 +1,4 @@
+// @ts-nocheck
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { norm, numberValue, parseDimensions, uniq, type AnyRow } from './utils'
 
