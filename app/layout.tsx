@@ -1,4 +1,5 @@
 import './globals.css'
+import './product.css'
 
 export const metadata = {
   title: 'SB Product Brain',
