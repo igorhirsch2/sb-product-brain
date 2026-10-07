@@ -1,7 +1,8 @@
 'use client'
 
-import { useEffect, useState } from 'react'
-import { createClient } from '@supabase/supabase-js'
+import { useEffect, useRef, useState } from 'react'
+import { queryAll } from '@/lib/queryAll'
+import { priceOverrides } from '@/lib/proposalReview'
 import { dateBR, DOC_LABELS, STATUS_LABELS } from '@/lib/utils'
 
 const cleanLines=(value:string)=>Array.from(new Set(value.split(/\n|,/).map(x=>x.trim()).filter(Boolean)))
@@ -12,7 +13,7 @@ const inferredType=(name:string)=>{
 }
 const withoutReview=(data:any)=>{const copy={...(data||{})};delete copy._human_review;return copy}
 
-export default function SupplierView({brand,tab,setTab,products,docs,terms,promos,reps,proposals,profiles,onBack,openModal,approve,reject,openOriginal}:any){
+export default function SupplierView({supabase,jobs=[],busy=false,refresh,brand,tab,setTab,products,docs,terms,promos,reps,proposals,profiles,onBack,openModal,approve,reject,openOriginal}:any){
   const [localProposals,setLocalProposals]=useState<any[]>(proposals||[])
   const [editor,setEditor]=useState<any|null>(null)
   const [editorMode,setEditorMode]=useState<'edit'|'source'>('edit')
@@ -22,32 +23,41 @@ export default function SupplierView({brand,tab,setTab,products,docs,terms,promo
   const [saving,setSaving]=useState(false)
   const [selectedIds,setSelectedIds]=useState<Set<string>>(new Set())
   const [bulkType,setBulkType]=useState('')
+  const [reviewSearch,setReviewSearch]=useState(''),[documentFilter,setDocumentFilter]=useState('')
+  const [feedback,setFeedback]=useState(''),[reprocessing,setReprocessing]=useState<string|null>(null)
+  const [sourceLimit,setSourceLimit]=useState(100)
+  const sourceRequest=useRef(0),reprocessLock=useRef(false)
 
   useEffect(()=>setLocalProposals(proposals||[]),[proposals])
-  const pending=localProposals.filter((p:any)=>p.status==='pending')
+  const pending=localProposals.filter((p:any)=>p.status==='pending'&&jobs.find((j:any)=>j.id===p.job_id)?.status==='review')
+  const visiblePending=pending.filter((p:any)=>(!documentFilter||p.source_document_id===documentFilter)&&`${p.proposed_data?.name||''} ${(p.proposed_data?.supplier_codes||[]).join(' ')}`.toLocaleLowerCase('pt-BR').includes(reviewSearch.toLocaleLowerCase('pt-BR')))
 
-  function client(){
-    const url=process.env.NEXT_PUBLIC_SUPABASE_URL,key=process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY
-    return url&&key?createClient(url,key):null
-  }
+  function client(){return supabase}
 
   async function reprocess(d:any){
-    const supabase=client();if(!supabase)return alert('Supabase não configurado.')
-    const {data:{session}}=await supabase.auth.getSession()
-    if(!session)return alert('Sua sessão expirou. Entre novamente.')
-    if(!confirm(`Reprocessar ${d.filename}? O arquivo original já armazenado será usado.`))return
-    const ji=await supabase.from('ingestion_jobs').insert({source_document_id:d.id,status:'processing',parser_type:'astra_server_v2_reprocess',started_at:new Date().toISOString(),created_by:session.user.id,metadata:{reprocess:true,filename:d.filename,document_type:d.document_type,price_basis:d.price_basis}}).select().single()
-    if(ji.error)return alert(ji.error.message)
-    await supabase.from('source_documents').update({status:'processing',approval_status:'pending'}).eq('id',d.id)
-    const response=await fetch('/api/process-document',{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${session.access_token}`},body:JSON.stringify({documentId:d.id,jobId:ji.data.id})})
-    const body=await response.json().catch(()=>({}))
-    if(!response.ok)return alert(body.error||'Falha no reprocessamento.')
-    alert(`Concluído: ${body.summary?.products_detected||0} produtos detectados e ${body.summary?.prices_detected||0} preços para revisão.`)
-    window.location.reload()
+    if(reprocessLock.current||busy)return
+    const supabase=client();if(!supabase)return setFeedback('Supabase não configurado.')
+    const latest=jobs.find((j:any)=>j.source_document_id===d.id)
+    if(latest?.status==='processing')return setFeedback('Este arquivo está em processamento. Atualize o status antes de tentar novamente.')
+    if(pending.some(p=>p.source_document_id===d.id))return setFeedback('Revise ou rejeite as propostas pendentes deste arquivo antes de reprocessar.')
+    reprocessLock.current=true;setReprocessing(d.id);setFeedback('Lendo o original armazenado…')
+    try{
+      const {data:{session}}=await supabase.auth.getSession()
+      if(!session)throw new Error('Sua sessão expirou. Entre novamente.')
+      const ji=latest?.status==='queued'?{data:latest,error:null}:await supabase.from('ingestion_jobs').insert({source_document_id:d.id,status:'queued',parser_type:'astra_pending_v5',created_by:session.user.id,metadata:{reprocess:true,filename:d.filename}}).select().single()
+      if(ji.error)throw ji.error
+      const response=await fetch('/api/process-document',{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${session.access_token}`},body:JSON.stringify({documentId:d.id,jobId:ji.data.id})})
+      const body=await response.json().catch(()=>({}))
+      if(!response.ok)throw new Error(body.error||'Falha no reprocessamento. Atualize o status para consultar o resultado.')
+      setFeedback(`${body.summary?.products_detected||0} produtos e ${body.summary?.prices_detected||0} preços para revisão. ${(body.summary?.warnings||[]).join(' ')}`)
+      setTab('intelligence')
+    }catch(e:any){setFeedback(e.message||String(e))}
+    finally{await refresh?.();reprocessLock.current=false;setReprocessing(null)}
   }
 
   async function openProposalEditor(p:any,mode:'edit'|'source'='edit'){
-    setEditor(p);setEditorMode(mode);setSourceRows([])
+    const request=++sourceRequest.current
+    setEditor(p);setEditorMode(mode);setSourceRows([]);setSourceLimit(100)
     const pd=p.proposed_data||{}
     const variantLabels=pd.included_variant_labels||pd.variant_labels||[]
     const dimensions=pd.included_dimensions||pd.dimensions||[]
@@ -58,11 +68,11 @@ export default function SupplierView({brand,tab,setTab,products,docs,terms,promo
       manufacturer_code:pd.manufacturer_code||pd.supplier_codes?.[0]||'',
       supplier_codes:asLines(pd.supplier_codes||[]),
       variant_labels:variantLabels,
-      all_variant_labels:pd.variant_labels||[],
+      all_variant_labels:pd._human_review?.original?.variant_labels||pd.variant_labels||[],
       dimensions,
-      all_dimensions:pd.dimensions||[],
+      all_dimensions:pd._human_review?.original?.dimensions||pd.dimensions||[],
       pricing_groups:pricingGroups,
-      all_pricing_groups:pd.pricing_groups||[],
+      all_pricing_groups:pd._human_review?.original?.pricing_groups||pd.pricing_groups||[],
       modules:asLines(pd.modules||[]),
       review_notes:p.review_notes||'',
       price_overrides:{...(pd.price_overrides||{})}
@@ -70,14 +80,11 @@ export default function SupplierView({brand,tab,setTab,products,docs,terms,promo
     setLoadingSource(true)
     try{
       const supabase=client();if(!supabase)return
-      const codes=(pd._source_supplier_codes||pd.supplier_codes||[]).filter(Boolean).slice(0,100)
-      let query=supabase.from('extraction_rows').select('id,row_index,sheet_name,product_name_raw,supplier_product_code,dimension_label,pricing_group,price_value,price_basis,source_locator,raw_payload').eq('job_id',p.job_id).order('row_index',{ascending:true}).limit(400)
-      if(codes.length)query=query.in('supplier_product_code',codes)
-      else if(pd.name)query=query.eq('product_name_raw',pd.name)
-      const {data,error}=await query
-      if(error)throw error
-      setSourceRows(data||[])
-    }catch(e:any){alert(`Não consegui abrir a origem: ${e.message||e}`)}finally{setLoadingSource(false)}
+      const rows=await queryAll<any>((from,to)=>supabase.from('extraction_rows').select('id,row_index,sheet_name,product_name_raw,supplier_product_code,dimension_label,pricing_group,price_value,price_basis,source_locator,raw_payload').eq('job_id',p.job_id).order('id').range(from,to))
+      const codes=pd._source_supplier_codes||pd.supplier_codes||[]
+      const originalName=pd._human_review?.original?.name||pd.name
+      if(request===sourceRequest.current)setSourceRows(rows.filter(r=>codes.length?codes.includes(r.supplier_product_code):r.product_name_raw===originalName))
+    }catch(e:any){alert(`Não consegui abrir a origem: ${e.message||e}`)}finally{if(request===sourceRequest.current)setLoadingSource(false)}
   }
 
   function toggleDraft(field:'variant_labels'|'dimensions'|'pricing_groups',value:string){
@@ -94,7 +101,8 @@ export default function SupplierView({brand,tab,setTab,products,docs,terms,promo
     const {data:{session}}=await supabase.auth.getSession();if(!session)return alert('Sua sessão expirou.')
     const before=withoutReview(editor.proposed_data||{})
     const supplierCodes=cleanLines(draft.supplier_codes||'')
-    const cleanOverrides=Object.fromEntries(Object.entries(draft.price_overrides||{}).filter(([,v]:any)=>v!==''&&v!=null&&!Number.isNaN(Number(v))).map(([k,v]:any)=>[k,Number(v)]))
+    let cleanOverrides:Record<string,number>
+    try{cleanOverrides=priceOverrides(draft.price_overrides)}catch(e:any){return alert(e.message)}
     const nextData={
       ...before,
       name:String(draft.name||'').trim(),
@@ -103,11 +111,11 @@ export default function SupplierView({brand,tab,setTab,products,docs,terms,promo
       manufacturer_code:String(draft.manufacturer_code||supplierCodes[0]||'').trim()||null,
       supplier_codes:supplierCodes,
       _source_supplier_codes:before._source_supplier_codes||before.supplier_codes||[],
-      variant_labels:draft.variant_labels||[],
+      variant_labels:before._human_review?.original?.variant_labels||draft.all_variant_labels||[],
       included_variant_labels:draft.variant_labels||[],
-      dimensions:draft.dimensions||[],
+      dimensions:draft.all_dimensions||[],
       included_dimensions:draft.dimensions||[],
-      pricing_groups:draft.pricing_groups||[],
+      pricing_groups:draft.all_pricing_groups||[],
       included_pricing_groups:draft.pricing_groups||[],
       modules:cleanLines(draft.modules||''),
       price_overrides:cleanOverrides
@@ -123,12 +131,12 @@ export default function SupplierView({brand,tab,setTab,products,docs,terms,promo
     if(!nextData.supplier_codes.length)return alert('Mantenha ao menos um código do fornecedor.')
     setSaving(true)
     try{
-      const {error}=await supabase.from('change_proposals').update({proposed_data:nextData,review_notes:draft.review_notes||null}).eq('id',editor.id)
+      const {error}=await supabase.from('change_proposals').update({proposed_data:nextData,review_notes:draft.review_notes||null}).eq('id',editor.id).eq('status','pending').select('id').single()
       if(error)throw error
       const updated={...editor,proposed_data:nextData,review_notes:draft.review_notes||null}
       setLocalProposals(list=>list.map(x=>x.id===editor.id?updated:x))
-      setEditor(null)
       if(applyAfter)await approve(updated)
+      setEditor(null)
     }catch(e:any){alert(e.message||String(e))}finally{setSaving(false)}
   }
 
@@ -151,9 +159,10 @@ export default function SupplierView({brand,tab,setTab,products,docs,terms,promo
   }
 
   function toggleSelected(id:string){setSelectedIds(prev=>{const n=new Set(prev);n.has(id)?n.delete(id):n.add(id);return n})}
-  function selectAll(){setSelectedIds(selectedIds.size===pending.length?new Set():new Set(pending.map((p:any)=>p.id)))}
+  function selectAll(){setSelectedIds(visiblePending.every(p=>selectedIds.has(p.id))?new Set():new Set(visiblePending.map((p:any)=>p.id)))}
 
   return <>
+    {feedback&&<div className="notice" role="status">{feedback}<button onClick={()=>setFeedback('')} aria-label="Fechar aviso">×</button></div>}
     <button className="back" onClick={onBack}>← Fornecedores</button>
     <header><div><p className="eyebrow">FORNECEDOR / MARCA</p><h1>{brand.name}</h1><p className="muted">{[brand.legal_name,brand.city,brand.state].filter(Boolean).join(' · ')||'Ficha central do fornecedor'}</p></div><button className="primary" onClick={()=>openModal('brand',brand)}>Editar cadastro</button></header>
     <div className="supplierTabs">{[['overview','Visão Geral'],['products','Produtos'],['files','Arquivos'],['terms','Condições Comerciais'],['promos','Promoções'],['reps','Representantes'],['intelligence',`Inteligência${pending.length?` (${pending.length})`:''}`]].map(([k,l])=><button key={k} className={tab===k?'on':''} onClick={()=>setTab(k)}>{l}</button>)}</div>
@@ -165,7 +174,7 @@ export default function SupplierView({brand,tab,setTab,products,docs,terms,promo
 
     {tab==='products'&&<section className="panel"><div className="panelHead"><h2>Produtos do fornecedor</h2><span>{products.length}</span></div>{products.map((p:any)=><div className="productRow" key={p.id}><div><b>{p.name}</b><small>{p.public_id||'Sem SB-ID'} · {p.manufacturer_code||'sem código'}</small></div><span className="pill">{STATUS_LABELS[p.status]||p.status}</span></div>)}</section>}
 
-    {tab==='files'&&<><SectionTitle title="Central de arquivos" text="Tabelas, catálogos, acabamentos, promoções e condições comerciais." action="+ Importar arquivo" onAction={()=>openModal('upload',{document_type:'price_table',price_basis:'cost',ipi_mode:'unknown',freight_mode:'unknown'})}/><div className="docGrid">{docs.map((d:any)=><article className="docCard" key={d.id}><div className="docIcon">{d.document_type==='price_table'?'$':'⌁'}</div><div><b>{d.filename}</b><p>{DOC_LABELS[d.document_type]||d.document_type} · {d.price_basis==='cost'?'Custo':d.price_basis==='sale'?'Venda':'—'}</p><div className="tags"><span className={`pill ${d.status==='error'?'danger':''}`}>{STATUS_LABELS[d.status]||d.status}</span>{d.valid_from&&<span className="pill">desde {dateBR(d.valid_from)}</span>}</div></div><div className="docActions"><button onClick={()=>openOriginal(d)}>Original</button>{/\.(xlsx|xls|csv)$/i.test(d.filename)&&<button onClick={()=>reprocess(d)}>Reprocessar</button>}</div></article>)}</div></>}
+    {tab==='files'&&<><SectionTitle title="Central de arquivos" text="Tabelas, catálogos, acabamentos, promoções e condições comerciais." action="+ Importar arquivo" onAction={()=>openModal('upload',{document_type:'price_table',price_basis:'cost',ipi_mode:'unknown',freight_mode:'unknown'})}/><button onClick={()=>refresh?.()} disabled={!!reprocessing}>Atualizar status</button><div className="docGrid">{docs.map((d:any)=><article className="docCard" key={d.id}><div className="docIcon">{d.document_type==='price_table'?'$':'⌁'}</div><div><b>{d.filename}</b><p>{DOC_LABELS[d.document_type]||d.document_type} · {d.price_basis==='cost'?'Custo':d.price_basis==='sale'?'Venda':'—'}</p><div className="tags"><span className={`pill ${d.status==='error'?'danger':''}`}>{STATUS_LABELS[d.status]||d.status}</span>{d.valid_from&&<span className="pill">desde {dateBR(d.valid_from)}</span>}</div></div>{jobs.find((j:any)=>j.source_document_id===d.id)&&<div className="jobSummary"><p>{jobs.find((j:any)=>j.source_document_id===d.id)?.extraction_summary?.products_detected||0} produtos · {jobs.find((j:any)=>j.source_document_id===d.id)?.total_rows||0} preços</p>{jobs.find((j:any)=>j.source_document_id===d.id)?.error_message&&<p role="alert">{jobs.find((j:any)=>j.source_document_id===d.id)?.error_message}</p>}{(jobs.find((j:any)=>j.source_document_id===d.id)?.extraction_summary?.warnings||[]).map((w:string)=><p key={w}>{w}</p>)}</div>}<div className="docActions"><button onClick={()=>openOriginal(d)}>Original</button>{d.document_type==='price_table'&&/\.(xlsx|xls|csv)$/i.test(d.filename)&&<button disabled={!!reprocessing||busy||jobs.find((j:any)=>j.source_document_id===d.id)?.status==='processing'} onClick={()=>reprocess(d)}>{reprocessing===d.id?'Processando…':'Reprocessar'}</button>}{localProposals.some(p=>p.source_document_id===d.id&&p.status==='pending')&&<button onClick={()=>{setDocumentFilter(d.id);setTab('intelligence')}}>Revisar produtos</button>}</div></article>)}</div></>}
 
     {tab==='terms'&&<><SectionTitle title="Condições comerciais" text="Histórico versionado para preservar o contexto de cada venda." action="+ Nova condição" onAction={()=>openModal('terms',{ipi_mode:'unknown',freight_mode:'unknown'})}/><section className="panel">{terms.map((t:any)=><div className="termRow" key={t.id}><div><b>{dateBR(t.valid_from)} → {dateBR(t.valid_until)}</b><small>{t.payment_terms||'Pagamento não informado'}</small></div><span>Markup {t.target_markup||'—'} / mín. {t.minimum_markup||'—'}</span><span>{t.lead_time_min_days||'—'}–{t.lead_time_max_days||'—'} dias</span><span>IPI {t.ipi_rate??'—'}% · Frete {t.freight_value??'—'}</span></div>)}</section></>}
 
@@ -174,14 +183,15 @@ export default function SupplierView({brand,tab,setTab,products,docs,terms,promo
     {tab==='reps'&&<><SectionTitle title="Representantes" text="Contatos comerciais vinculados ao fornecedor." action="+ Representante" onAction={()=>openModal('rep')}/><div className="brandGrid">{reps.map((r:any)=><article className="brandCard" key={r.id}><div><h2>{r.contact_name}{r.is_primary?' ★':''}</h2><p>{r.company_name||brand.name}</p><p>{r.whatsapp||r.phone||'sem telefone'} · {r.region||'região não informada'}</p></div></article>)}</div></>}
 
     {tab==='intelligence'&&<><SectionTitle title="Astra · Interpretação e aprovação" text="Revise, corrija e aprove. A extração original fica preservada para auditoria e aprendizado do fornecedor."/><div className="aiStats">{profiles.map((p:any)=><article className="panel pad" key={p.id}><span className="eyebrow">PERFIL DE LEITURA</span><h3>{p.profile_name}</h3><p>Versão {p.version} · {p.successful_runs} leituras · confiança {Math.round(Number(p.confidence||0)*100)}%</p><small>{(p.learned_mapping?.price_headers||[]).slice(0,8).join(' · ')||'Ainda aprendendo cabeçalhos'}</small></article>)}</div>
+      <div className="reviewFilters"><input aria-label="Buscar proposta" placeholder="Buscar produto ou código…" value={reviewSearch} onChange={e=>setReviewSearch(e.target.value)}/><select aria-label="Filtrar por arquivo" value={documentFilter} onChange={e=>setDocumentFilter(e.target.value)}><option value="">Todos os arquivos</option>{docs.map((d:any)=><option key={d.id} value={d.id}>{d.filename}</option>)}</select><span>{visiblePending.length} de {pending.length} propostas</span></div>
       {selectedIds.size>0&&<div className="bulkReview"><b>{selectedIds.size} selecionado{selectedIds.size>1?'s':''}</b><input value={bulkType} onChange={e=>setBulkType(e.target.value)} placeholder="Tipo/categoria (ex.: Sofá)"/><button onClick={applyBulkType} disabled={!bulkType.trim()||saving}>Aplicar tipo</button><button onClick={()=>setSelectedIds(new Set())}>Limpar seleção</button></div>}
-      <section className="panel"><div className="panelHead"><div className="proposalHead"><input type="checkbox" checked={pending.length>0&&selectedIds.size===pending.length} onChange={selectAll}/><h2>Propostas para aprovação</h2></div><span>{pending.length} pendentes</span></div>{pending.length===0?<div className="empty">Nenhuma proposta pendente.</div>:pending.map((p:any)=><div className="proposal" key={p.id}><input className="proposalCheck" type="checkbox" checked={selectedIds.has(p.id)} onChange={()=>toggleSelected(p.id)}/><div><span className="eyebrow">{p.action==='create'?'NOVO PRODUTO':'ATUALIZAÇÃO'}{p.proposed_data?._human_review?' · CORRIGIDO':''}</span><h3>{p.proposed_data?.name}</h3><p>{p.proposed_data?.supplier_codes?.length||1} códigos · {p.proposed_data?.variant_labels?.length||0} variações · {p.proposed_data?.dimensions?.length||0} medidas · {p.proposed_data?.pricing_groups?.length||0} grupos · {p.proposed_data?.price_count||0} preços</p><small>{p.proposed_data?.product_type?`${p.proposed_data.product_type} · `:''}Confiança: {Math.round(Number(p.confidence||0)*100)}%</small></div><div className="proposalActions"><button onClick={()=>openProposalEditor(p,'source')}>Ver origem</button><button onClick={()=>openProposalEditor(p,'edit')}>Editar</button><button onClick={()=>reject(p)}>Rejeitar</button><button className="primary" onClick={()=>approve(p)}>Aprovar e aplicar</button></div></div>)}</section></>}
+      <section className="panel"><div className="panelHead"><div className="proposalHead"><input type="checkbox" aria-label="Selecionar propostas visíveis" checked={visiblePending.length>0&&visiblePending.every(p=>selectedIds.has(p.id))} onChange={selectAll}/><h2>Propostas para aprovação</h2></div><span>{pending.length} pendentes</span></div>{visiblePending.length===0?<div className="empty">Nenhuma proposta pronta para revisão com estes filtros. Consulte o resultado na aba Arquivos.</div>:visiblePending.map((p:any)=><div className="proposal" key={p.id}><input className="proposalCheck" aria-label={`Selecionar ${p.proposed_data?.name}`} type="checkbox" checked={selectedIds.has(p.id)} onChange={()=>toggleSelected(p.id)}/><div><span className="eyebrow">{p.action==='create'?'NOVO PRODUTO':'ATUALIZAÇÃO'}{p.proposed_data?._human_review?' · CORRIGIDO':''}</span><h3>{p.proposed_data?.name}</h3><p>{p.proposed_data?.supplier_codes?.length||1} códigos · {p.proposed_data?.variant_labels?.length||0} variações · {p.proposed_data?.dimensions?.length||0} medidas · {p.proposed_data?.pricing_groups?.length||0} grupos · {p.proposed_data?.price_count||0} preços</p><small>{p.proposed_data?.product_type?`${p.proposed_data.product_type} · `:''}Confiança: {Math.round(Number(p.confidence||0)*100)}%</small></div><div className="proposalActions"><button onClick={()=>openProposalEditor(p,'source')}>Ver origem</button><button onClick={()=>openProposalEditor(p,'edit')}>Editar</button><button disabled={busy||saving} onClick={()=>reject(p)}>Rejeitar</button><button className="primary" disabled={busy||saving} onClick={()=>approve(p).catch(()=>{})}>Aprovar e aplicar</button></div></div>)}</section></>}
 
-    {editor&&<div className="reviewBg" onMouseDown={e=>{if(e.currentTarget===e.target)setEditor(null)}}><aside className="reviewDrawer"><div className="reviewHead"><div><span className="eyebrow">REVISÃO ASTRA</span><h2>{editor.proposed_data?.name}</h2><p>{editor.source_locator?.sheet||'Origem não identificada'} · confiança {Math.round(Number(editor.confidence||0)*100)}%</p></div><button onClick={()=>setEditor(null)}>×</button></div><div className="reviewTabs"><button className={editorMode==='edit'?'on':''} onClick={()=>setEditorMode('edit')}>Editar proposta</button><button className={editorMode==='source'?'on':''} onClick={()=>setEditorMode('source')}>Origem e preços</button></div>
+    {editor&&<div className="reviewBg" onMouseDown={e=>{if(e.currentTarget===e.target)setEditor(null)}}><aside className="reviewDrawer" role="dialog" aria-modal="true" aria-label="Revisão da proposta"><div className="reviewHead"><div><span className="eyebrow">REVISÃO ASTRA</span><h2>{editor.proposed_data?.name}</h2><p>{editor.source_locator?.sheet||'Origem não identificada'} · confiança {Math.round(Number(editor.confidence||0)*100)}%</p></div><button onClick={()=>setEditor(null)}>×</button></div><div className="reviewTabs"><button className={editorMode==='edit'?'on':''} onClick={()=>setEditorMode('edit')}>Editar proposta</button><button className={editorMode==='source'?'on':''} onClick={()=>setEditorMode('source')}>Origem e preços</button></div>
       {editorMode==='edit'?<div className="reviewBody"><div className="reviewGrid"><label className="field span2"><span>Nome do produto</span><input value={draft.name||''} onChange={e=>setDraft((d:any)=>({...d,name:e.target.value}))}/></label><label className="field"><span>Tipo / categoria</span><input value={draft.product_type||''} onChange={e=>setDraft((d:any)=>({...d,product_type:e.target.value}))} placeholder="Sofá, Poltrona, Pufe…"/></label><label className="field"><span>Código principal</span><input value={draft.manufacturer_code||''} onChange={e=>setDraft((d:any)=>({...d,manufacturer_code:e.target.value}))}/></label><label className="field span2"><span>Códigos do fornecedor · um por linha</span><textarea rows={4} value={draft.supplier_codes||''} onChange={e=>setDraft((d:any)=>({...d,supplier_codes:e.target.value}))}/></label><label className="field span2"><span>Módulos identificados</span><textarea rows={3} value={draft.modules||''} onChange={e=>setDraft((d:any)=>({...d,modules:e.target.value}))}/></label></div>
         <ChoiceGroup title="Variações que entram no produto" values={draft.all_variant_labels||[]} selected={draft.variant_labels||[]} onToggle={(v:string)=>toggleDraft('variant_labels',v)}/><ChoiceGroup title="Medidas que entram no produto" values={draft.all_dimensions||[]} selected={draft.dimensions||[]} onToggle={(v:string)=>toggleDraft('dimensions',v)}/><ChoiceGroup title="Grupos de preço que entram no produto" values={draft.all_pricing_groups||[]} selected={draft.pricing_groups||[]} onToggle={(v:string)=>toggleDraft('pricing_groups',v)}/><label className="field"><span>Observação da revisão</span><textarea rows={3} value={draft.review_notes||''} onChange={e=>setDraft((d:any)=>({...d,review_notes:e.target.value}))} placeholder="Explique uma correção importante para o Astra aprender depois."/></label></div>:
-        <div className="reviewBody"><div className="sourceSummary"><div><span>Planilha</span><b>{editor.source_locator?.sheet||'—'}</b></div><div><span>Códigos</span><b>{(editor.proposed_data?._source_supplier_codes||editor.proposed_data?.supplier_codes||[]).join(', ')||'—'}</b></div><div><span>Linhas carregadas</span><b>{sourceRows.length}</b></div>{docs.find((d:any)=>d.id===editor.source_document_id)&&<button onClick={()=>openOriginal(docs.find((d:any)=>d.id===editor.source_document_id))}>Abrir arquivo original ↗</button>}</div>{loadingSource?<div className="empty">Carregando origem…</div>:<div className="priceReview"><div className="priceReviewHead"><span>Linha</span><span>Código / variação</span><span>Medida</span><span>Grupo</span><span>Preço</span></div>{sourceRows.map((r:any)=><div className="priceReviewRow" key={r.id}><span>{r.row_index}</span><span><b>{r.supplier_product_code}</b><small>{r.source_locator?.variant_label||r.product_name_raw||'—'}</small></span><span>{r.dimension_label||'—'}</span><span>{r.pricing_group||'—'}</span><label><span>R$</span><input inputMode="decimal" value={draft.price_overrides?.[r.id]??r.price_value??''} onChange={e=>setDraft((d:any)=>({...d,price_overrides:{...(d.price_overrides||{}),[r.id]:e.target.value}}))}/></label></div>)}</div>}</div>}
-      <div className="reviewActions"><button onClick={()=>setEditor(null)}>Cancelar</button><button onClick={()=>saveProposalCorrections(false)} disabled={saving}>{saving?'Salvando…':'Salvar correções'}</button><button className="primary" onClick={()=>saveProposalCorrections(true)} disabled={saving}>{saving?'Salvando…':'Salvar e aprovar'}</button></div></aside></div>}
+        <div className="reviewBody"><div className="sourceSummary"><div><span>Planilha</span><b>{editor.source_locator?.sheet||'—'}</b></div><div><span>Códigos</span><b>{(editor.proposed_data?._source_supplier_codes||editor.proposed_data?.supplier_codes||[]).join(', ')||'—'}</b></div><div><span>Linhas carregadas</span><b>{sourceRows.length}</b></div>{docs.find((d:any)=>d.id===editor.source_document_id)&&<button onClick={()=>openOriginal(docs.find((d:any)=>d.id===editor.source_document_id))}>Abrir arquivo original ↗</button>}</div>{loadingSource?<div className="empty">Carregando origem…</div>:<div className="priceReview"><div className="priceReviewHead"><span>Linha</span><span>Código / variação</span><span>Medida</span><span>Grupo</span><span>Preço</span></div>{sourceRows.slice(0,sourceLimit).map((r:any)=><div className="priceReviewRow" key={r.id}><span>{r.row_index}</span><span><b>{r.supplier_product_code}</b><small>{r.source_locator?.variant_label||r.product_name_raw||'—'}</small></span><span>{r.dimension_label||'—'}</span><span>{r.pricing_group||'—'}</span><label><span>R$</span><input aria-label={`Preço da linha ${r.row_index}, ${r.pricing_group||'único'}`} inputMode="decimal" value={draft.price_overrides?.[r.id]??r.price_value??''} onChange={e=>setDraft((d:any)=>({...d,price_overrides:{...(d.price_overrides||{}),[r.id]:e.target.value}}))}/></label></div>)}{sourceLimit<sourceRows.length&&<button onClick={()=>setSourceLimit(n=>n+100)}>Mostrar mais preços ({sourceLimit}/{sourceRows.length})</button>}</div>}</div>}
+      <div className="reviewActions"><button onClick={()=>setEditor(null)}>Cancelar</button><button onClick={()=>saveProposalCorrections(false)} disabled={saving||busy||loadingSource}>{saving?'Salvando…':'Salvar correções'}</button><button className="primary" onClick={()=>saveProposalCorrections(true)} disabled={saving||busy||loadingSource}>{saving?'Salvando…':'Salvar e aprovar'}</button></div></aside></div>}
   </>
 }
 

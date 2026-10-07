@@ -9,7 +9,7 @@ export const DOC_LABELS: Record<string,string> = {
 export const STATUS_LABELS: Record<string,string> = {
   draft:'Rascunho', in_progress:'Em cadastro', in_review:'Em revisão', approved:'Aprovado',
   active:'Ativo', inactive:'Inativo', discontinued:'Descontinuado', archived:'Arquivado',
-  uploaded:'Enviado', processing:'Processando', review:'Revisão', error:'Erro', pending:'Pendente',
+  queued:'Aguardando leitura', needs_review:'Revisão necessária', uploaded:'Enviado', processing:'Processando', review:'Revisão', error:'Erro', pending:'Pendente',
   applied:'Aplicado', rejected:'Rejeitado'
 }
 
@@ -24,6 +24,7 @@ export function numberValue(v:any){
   let s=String(v??'').trim().replace(/R\$|\s/g,'')
   if(!s||/^[-–—]+$/.test(s)) return null
   s=s.replace(/%$/,'')
+  if(!/^[-+]?\d[\d.,]*$/.test(s)) return null
   const comma=s.lastIndexOf(','), dot=s.lastIndexOf('.')
   if(comma>=0&&dot>=0){
     if(comma>dot) s=s.replace(/\./g,'').replace(',','.')
@@ -35,17 +36,17 @@ export function numberValue(v:any){
     const decimals=s.length-dot-1
     if(decimals===3&&dot>0&&/^[-+]?\d{1,3}(\.\d{3})+$/.test(s)) s=s.replace(/\./g,'')
   }
-  const n=Number(s.replace(/[^0-9.+-]/g,''))
+  const n=Number(s)
   return Number.isFinite(n)?n:null
 }
 
 export function parseDimensions(v:any){
   const text=String(v??'').trim()
-  const m=text.match(/(\d{2,4}(?:[.,]\d+)?)\s*[xX×]\s*(\d{2,4}(?:[.,]\d+)?)(?:\s*[xX×]\s*(\d{2,4}(?:[.,]\d+)?))?/)
-  const mm=(x?:string|null)=>{if(!x)return null;const n=numberValue(x);return n==null?null:Math.round(n<1000?n*10:n)}
-  if(m) return {width_mm:mm(m[1]),depth_mm:mm(m[2]),height_mm:mm(m[3]),dimension_label:m[0]}
-  const one=text.match(/^\s*(\d{2,4}(?:[.,]\d+)?)\s*(?:cm)?\s*$/i)
-  if(one) return {width_mm:mm(one[1]),depth_mm:null,height_mm:null,dimension_label:text}
+  const m=text.match(/^(\d+(?:[.,]\d+)?)\s*[xX×]\s*(\d+(?:[.,]\d+)?)(?:\s*[xX×]\s*(\d+(?:[.,]\d+)?))?\s*(mm|cm|m)?$/i)
+  const mm=(x:string|undefined,unit:string|undefined)=>{if(!x)return null;const n=Number(x.replace(',','.'));return Number.isFinite(n)?Math.round(n*(unit==='m'?1000:unit==='mm'?1:unit==='cm'?10:n<10?1000:n<1000?10:1)):null}
+  if(m) return {width_mm:mm(m[1],m[4]?.toLowerCase()),depth_mm:mm(m[2],m[4]?.toLowerCase()),height_mm:mm(m[3],m[4]?.toLowerCase()),dimension_label:text}
+  const one=text.match(/^(\d+(?:[.,]\d+)?)\s*(mm|cm|m)?$/i)
+  if(one) return {width_mm:mm(one[1],one[2]?.toLowerCase()),depth_mm:null,height_mm:null,dimension_label:text}
   return {}
 }
 

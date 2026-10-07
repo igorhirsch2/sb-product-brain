@@ -1,0 +1,14 @@
+'use client'
+// Synthetic local-only fixture. Not mounted in the production app.
+import { useState } from 'react'
+import SupplierView from '../components/SupplierView'
+import Modal from '../components/Modal'
+const doc={id:'doc',filename:'Tabela de teste.xlsx',document_type:'price_table',price_basis:'cost',status:'review'}
+const failedDoc={...doc,id:'failed',filename:'Tabela sem cabeçalho.csv',status:'error'}
+const initial=[{id:'proposal',job_id:'job',source_document_id:'doc',status:'pending',action:'create',confidence:.8,proposed_data:{name:'Sofá de teste',supplier_codes:['SB001'],variant_labels:['Dois lugares'],dimensions:[],pricing_groups:['Grupo A','Grupo B'],price_count:520},source_locator:{sheet:'Produtos'}}]
+const rows=Array.from({length:520},(_,i)=>({id:`row-${i}`,row_index:i+2,supplier_product_code:'SB001',product_name_raw:'Sofá de teste',price_value:1200,pricing_group:i%2?'Grupo B':'Grupo A',dimension_label:null,source_locator:{variant_label:'Dois lugares'},sheet_name:'Produtos'}))
+export default function Fixture(){
+  const [tab,setTab]=useState('files'),[proposals,setProposals]=useState(initial),[saved,setSaved]=useState(''),[modal,setModal]=useState(false),[form,setForm]=useState<any>({document_type:'price_table',price_basis:'cost'})
+  const db:any={auth:{getSession:async()=>({data:{session:{user:{id:'fixture'}}}})},from(table:string){let from=0,to=499,patch:any;const q:any={select(){return q},eq(){return q},order(){return q},range(a:number,b:number){from=a;to=b;return q},single(){return q},update(v:any){patch=v;return q},then(resolve:any){if(patch){setSaved(JSON.stringify(patch));setProposals(p=>p.map(x=>({...x,...patch})))}return Promise.resolve({data:table==='extraction_rows'?rows.slice(from,to+1):{id:'proposal'},error:null}).then(resolve)}};return q}}
+  return <main className="content"><p role="status">AMBIENTE LOCAL · dados fictícios</p><SupplierView supabase={db} brand={{id:'brand',name:'Fornecedor de teste'}} tab={tab} setTab={setTab} products={[]} docs={[doc,failedDoc]} jobs={[{id:'job',source_document_id:'doc',status:'review',total_rows:520,extraction_summary:{products_detected:1}},{id:'failed-job',source_document_id:'failed',status:'error',error_message:'Cabeçalho de preço não identificado. Confira o original.'}]} terms={[]} promos={[]} reps={[]} proposals={proposals} profiles={[]} onBack={()=>{}} refresh={()=>{}} openModal={()=>setModal(true)} openOriginal={()=>{}} approve={async(p:any)=>{setSaved('Aprovado: '+p.proposed_data.name);setProposals(list=>list.filter(x=>x.id!==p.id))}} reject={async(p:any)=>setProposals(list=>list.filter(x=>x.id!==p.id))}/>{modal&&<Modal kind="upload" form={form} setForm={setForm} close={()=>setModal(false)} uploadDocument={(e:any)=>e.preventDefault()}/>}<output aria-label="Resultado do teste">{saved}</output></main>
+}
