@@ -1,13 +1,41 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { effectiveCost, norm, slug, uniq, type AnyRow } from './utils'
+import { queryAll } from './queryAll'
+import { priceOverrides, selectProposalRows } from './proposalReview'
 import { syncSalesOptionsForPriceTable } from './salesOptions'
 
 export async function applyProductProposal(opts:{supabase:SupabaseClient; proposal:AnyRow; brand:AnyRow; userId:string}){
-  const {supabase,proposal,brand,userId}=opts
+  const {supabase,brand,userId}=opts
+  const fresh=await supabase.from('change_proposals').select('*').eq('id',opts.proposal.id).single()
+  if(fresh.error)throw fresh.error
+  const proposal=fresh.data
+  if(proposal.status==='applied')return proposal.target_id
+  if(proposal.status!=='pending')throw new Error('Esta proposta já foi revisada. Atualize a lista.')
+  if(proposal.brand_id!==brand.id)throw new Error('A proposta não pertence a este fornecedor.')
+  const job=await supabase.from('ingestion_jobs').select('status').eq('id',proposal.job_id).eq('source_document_id',proposal.source_document_id).single()
+  if(job.error)throw job.error
+  if(!['review','approved'].includes(job.data?.status))throw new Error('A extração não foi concluída. Atualize o processamento antes de aprovar.')
   const {data:doc,error:docError}=await supabase.from('source_documents').select('*').eq('id',proposal.source_document_id).single()
   if(docError)throw docError
   const pd=proposal.proposed_data||{}
   let productId=proposal.target_id as string|undefined
+
+  if(doc.brand_id!==brand.id)throw new Error('Documento e proposta pertencem a fornecedores diferentes.')
+  if(!['cost','sale'].includes(doc.price_basis))throw new Error('Informe se a tabela é de custo ou venda antes de aprovar.')
+  if(!String(pd.name||'').trim())throw new Error('Informe o nome do produto.')
+  const sourceRows=await queryAll((from,to)=>supabase.from('extraction_rows').select('*').eq('job_id',proposal.job_id).order('id').range(from,to))
+  const rows=selectProposalRows(sourceRows,pd)
+  const overrides=priceOverrides(pd.price_overrides)
+  const supplierCodes=uniq<string>((pd.supplier_codes?.length?pd.supplier_codes:[pd.manufacturer_code]).filter(Boolean))
+  if(!supplierCodes.length)throw new Error('Mantenha ao menos um código do fornecedor.')
+  const codeOwners=await queryAll((from,to)=>supabase.from('product_brand_codes').select('product_id,product_code').eq('brand_id',brand.id).order('product_code').range(from,to))
+  const owners=uniq(codeOwners.filter(c=>supplierCodes.includes(c.product_code)).map(c=>c.product_id))
+  if(owners.length>1||(productId&&owners.some(id=>id!==productId)))throw new Error('Há códigos vinculados a outro produto. Revise o vínculo antes de aprovar.')
+  if(!productId&&owners.length===1)productId=owners[0]
+  if(productId){
+    const target=await supabase.from('products').select('id').eq('id',productId).eq('brand_id',brand.id).single()
+    if(target.error)throw target.error
+  }
 
   const productPayload={name:pd.name,brand_id:brand.id,manufacturer_code:pd.manufacturer_code||null,product_type:pd.product_type||pd.category||null,updated_by:userId}
   if(!productId){
@@ -21,34 +49,12 @@ export async function applyProductProposal(opts:{supabase:SupabaseClient; propos
     if(updated.error)throw updated.error
   }
 
-  const supplierCodes=uniq<string>((pd.supplier_codes?.length?pd.supplier_codes:[pd.manufacturer_code]).filter(Boolean))
+  const checkpoint=await supabase.from('change_proposals').update({target_id:productId}).eq('id',proposal.id).eq('status','pending').select('id').single()
+  if(checkpoint.error)throw checkpoint.error
   for(const [i,c] of supplierCodes.entries()){
     const code=await supabase.from('product_brand_codes').upsert({product_id:productId,brand_id:brand.id,product_code:String(c),is_primary:i===0,metadata:{source_document_id:proposal.source_document_id}},{onConflict:'brand_id,product_code'})
     if(code.error)throw code.error
   }
-
-  const extraction=await supabase.from('extraction_rows').select('*').eq('job_id',proposal.job_id)
-  if(extraction.error)throw extraction.error
-  const sourceCodes=uniq<string>(((pd._source_supplier_codes?.length?pd._source_supplier_codes:supplierCodes)||[]).filter(Boolean))
-  let rows=(extraction.data||[]).filter((r:any)=>{
-    if(sourceCodes.some(c=>norm(c)===norm(r.supplier_product_code)))return true
-    return pd.name&&norm(r.product_name_raw)===norm(pd.name)
-  })
-
-  if(Array.isArray(pd.included_variant_labels)){
-    const allowed=new Set(pd.included_variant_labels.map((x:any)=>norm(x)))
-    rows=rows.filter((r:any)=>allowed.has(norm(r.source_locator?.variant_label||r.notes||'')))
-  }
-  if(Array.isArray(pd.included_dimensions)){
-    const allowed=new Set(pd.included_dimensions.map((x:any)=>norm(x)))
-    rows=rows.filter((r:any)=>allowed.has(norm(r.dimension_label||'')))
-  }
-  if(Array.isArray(pd.included_pricing_groups)){
-    const allowed=new Set(pd.included_pricing_groups.map((x:any)=>norm(x)))
-    rows=rows.filter((r:any)=>allowed.has(norm(r.pricing_group||'')))
-  }
-
-  if(!rows.length)throw new Error('A proposta ficou sem linhas de origem após as correções. Revise códigos, variações, medidas e grupos de preço antes de aprovar.')
 
   const existingDims=await supabase.from('product_dimensions').select('*').eq('product_id',productId)
   if(existingDims.error)throw existingDims.error
@@ -87,7 +93,7 @@ export async function applyProductProposal(opts:{supabase:SupabaseClient; propos
     }
   }
 
-  const variants=uniq<string>((pd.variant_labels||[]).filter((v:any)=>v&&norm(v)!==norm(pd.name)))
+  const variants=uniq<string>((pd.included_variant_labels||pd.variant_labels||[]).filter((v:any)=>v&&norm(v)!==norm(pd.name)))
   if(variants.length>1){
     const groupCode=`${slug(brand.name)}-${slug(pd.name)}-variacao`
     let {data:vg,error:vgErr}=await supabase.from('option_groups').select('*').eq('code',groupCode).maybeSingle()
@@ -125,7 +131,6 @@ export async function applyProductProposal(opts:{supabase:SupabaseClient; propos
   }
 
   const referenceMarkup=Number(doc.reference_markup||priceTable.reference_markup||0)||null
-  const overrides=pd.price_overrides||{}
   const entries=rows.map((r:any)=>{
     const overridden=Object.prototype.hasOwnProperty.call(overrides,r.id)
     const source=overridden?Number(overrides[r.id]):Number(r.price_value)
@@ -149,6 +154,7 @@ export async function applyProductProposal(opts:{supabase:SupabaseClient; propos
   if(cp.error)throw cp.error
 
   const remaining=await supabase.from('change_proposals').select('id',{count:'exact',head:true}).eq('source_document_id',proposal.source_document_id).eq('status','pending')
-  if(!remaining.count)await supabase.from('source_documents').update({status:'approved',approval_status:'approved'}).eq('id',proposal.source_document_id)
+  if(remaining.error)throw remaining.error
+  if(remaining.count===0)await supabase.from('source_documents').update({status:'approved',approval_status:'approved'}).eq('id',proposal.source_document_id)
   return productId
 }
