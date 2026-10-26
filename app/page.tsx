@@ -54,7 +54,21 @@ export default function Home(){
     ])
     setDocs(d.data||[]);setTerms(t.data||[]);setPromos(pm.data||[]);setReps(r.data||[]);setProposals(cp.data||[]);setProfiles(ai.data||[])
   }
-  async function login(e:React.FormEvent){e.preventDefault();setMessage('Entrando...');if(!supabase)return setMessage('Supabase não configurado.');const {error}=await supabase.auth.signInWithPassword({email,password});setMessage(error?error.message:'')}
+  async function login(e:React.FormEvent){
+    e.preventDefault()
+    setMessage('Entrando...')
+    if(!supabase)return setMessage('Supabase não configurado.')
+    try{
+      const {error}=await supabase.auth.signInWithPassword({email,password})
+      if(!error){setMessage('');return}
+      const raw=String(error.message||'')
+      const friendly=/invalid login credentials/i.test(raw)?'E-mail ou senha inválidos.':/failed to fetch|network|service unavailable|503|502/i.test(raw)?'O servidor do Product Brain está temporariamente indisponível. Tente novamente após atualizar a página.':raw
+      setMessage(friendly)
+    }catch(err:any){
+      const raw=String(err?.message||err||'')
+      setMessage(/failed to fetch|network/i.test(raw)?'O servidor do Product Brain está temporariamente indisponível. Tente novamente após atualizar a página.':raw||'Não foi possível entrar.')
+    }
+  }
   function openModal(kind:string,initial:AnyRow={}){setForm(initial);setModal(kind)}
   function openSupplier(b:Brand){setSelectedBrand(b);setSupplierTab('overview');setActive('fornecedores')}
 
